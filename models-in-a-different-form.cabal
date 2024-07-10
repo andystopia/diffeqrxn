@@ -57,12 +57,15 @@ common warnings
 executable models-in-a-different-form
     -- Import common warning flags.
     import:           warnings
+    -- pgml impurity should be removable after: github.com/NixOS/nixpkgs/pull/317224
+    -- merges and is on some stable version of the nixpkgs
+    ghc-options: -fplugin=Effectful.Plugin -pgml /usr/bin/cc
 
     -- .hs or .lhs file containing the Main module.
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    other-modules: TypeChecker
+    other-modules: TypeChecker, CodeWriter, JSONExporter, ContainedParser
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -75,8 +78,12 @@ executable models-in-a-different-form
                       , pretty-show ^>= 1.10
                       , megaparsec ^>= 9.6.1
                       , diagnose ^>= 2.5.1
-                      , containers ^>= 0.6.8
+                      , containers ^>= 0.6.7
                       , split ^>= 0.2.5
+                      , effectful ^>= 2.3.1.0
+                      , aeson
+                      , effectful-plugin ^>= 1.1.0.3
+                      , effectful-core
 
     -- Directories containing source files.
     hs-source-dirs:   app
