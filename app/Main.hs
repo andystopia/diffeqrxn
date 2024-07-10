@@ -12,6 +12,7 @@
 
 module Main where
 
+import qualified Cli
 import qualified CodeWriter as CW
 import Control.Applicative ((<|>))
 import Control.Monad (unless, void, when)
@@ -707,21 +708,20 @@ intercalateStringPeriodically maxLen inner list =
     intercalateStringPeriodicallyH :: Int -> Int -> String -> [String] -> [String]
     intercalateStringPeriodicallyH _ _ _ [] = []
     intercalateStringPeriodicallyH _ _ _ [a] = [a]
-    intercalateStringPeriodicallyH count maxLen inner (current:rest) =
-      if count + length current > maxLen then
-        [inner, current] ++ intercalateStringPeriodicallyH (length inner) maxLen inner rest
-      else
-        current : intercalateStringPeriodicallyH (length current + count) maxLen inner rest
+    intercalateStringPeriodicallyH count maxLen inner (current : rest) =
+      if count + length current > maxLen
+        then [inner, current] ++ intercalateStringPeriodicallyH (length inner) maxLen inner rest
+        else current : intercalateStringPeriodicallyH (length current + count) maxLen inner rest
 
 exportASTToTypst' :: ExportAST -> String
 exportASTToTypst' export = case export of
-    (ExportSum s) ->
-      concat $
-        -- add typst newlines in equations
-        -- every 120 characters. This is a rough approximation
-        -- but it's at least a little more convenient than manually 
-        -- adding them every time a variable is changed
-        intercalateStringPeriodically 120 " \\ & " $
+  (ExportSum s) ->
+    concat $
+      -- add typst newlines in equations
+      -- every 120 characters. This is a rough approximation
+      -- but it's at least a little more convenient than manually
+      -- adding them every time a variable is changed
+      intercalateStringPeriodically 120 " \\ & " $
         intersperseCondEither
           func'
           ( \case
@@ -731,11 +731,9 @@ exportASTToTypst' export = case export of
           " - "
           " + "
           s
-
-    _ -> exportASTToTypst export
+  _ -> exportASTToTypst export
   where
     func' = exportASTGroupMaybeASCII exportASTToTypst export
-
 
 exportAstGroupMaybe :: (ExportAST -> String) -> (ExportAST -> String) -> ExportAST -> ExportAST -> String
 exportAstGroupMaybe whenNotGrouped whenGrouped parentAstNode astNode =
@@ -1251,28 +1249,37 @@ jsonExport modelName (ResolvedVariableModel stateVars sysParams _dependent _eqns
 
 main :: IO ()
 main = do
-  let filePath = "models/model-dark-dimer.rxn"
-  modelEquations <- parseEquationText filePath
-  fileContents <- readFile filePath
+  opt <- Cli.cli
 
-  res <- runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
-    semAddFile filePath fileContents
-    semActivateFile filePath
+  case opt of
+    Cli.SubcommandExport (Cli.ExportOpts filePath modelName exportFormat) -> do
+      modelEquations <- parseEquationText filePath
+      fileContents <- readFile filePath
 
-    let normalForms = equationsToNormalForm modelEquations
+      res <- runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
+        semAddFile filePath fileContents
+        semActivateFile filePath
 
+        let normalForms = equationsToNormalForm modelEquations
 
-    -- take the equations that are in normal form
-    -- and resolve and expand their macros.
-    resolved <- resolveEquations basicMacroProvider normalForms
+        -- take the equations that are in normal form
+        -- and resolve and expand their macros.
+        resolved <- resolveEquations basicMacroProvider normalForms
 
-    -- return $ CW.evalStringCodeWriter 4 (typstExporter "DarkModel" resolved)
+        let runExporter model = CW.evalStringCodeWriter 4 (model modelName resolved)
 
-    return $ jsonExport "DarkModel" resolved
-  case res of
-    Left err -> do
-      void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
-    Right success ->
-      liftIO $ putStrLn success
+        return
+          ( case exportFormat of
+              Cli.JSONExport -> jsonExport modelName resolved
+              Cli.AsciiExport -> runExporter asciiExporter
+              Cli.JuliaExport ->  runExporter juliaExporter
+              Cli.TypstExport ->  runExporter typstExporter
+          )
+      -- return $ jsonExport modelName resolved
+      case res of
+        Left err -> do
+          void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
+        Right success ->
+          liftIO $ putStrLn success
 
-  return ()
+      return ()

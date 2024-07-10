@@ -65,7 +65,7 @@ executable models-in-a-different-form
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    other-modules: TypeChecker, CodeWriter, JSONExporter, ContainedParser
+    other-modules: TypeChecker, CodeWriter, JSONExporter, ContainedParser, Cli
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
@@ -83,6 +83,7 @@ executable models-in-a-different-form
                       , effectful ^>= 2.3.1.0
                       , aeson
                       , effectful-plugin ^>= 1.1.0.3
+                      , optparse-applicative ^>= 0.18.1.0
                       , effectful-core
 
     -- Directories containing source files.
