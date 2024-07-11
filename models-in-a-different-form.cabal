@@ -54,6 +54,9 @@ extra-doc-files:    CHANGELOG.md
 common warnings
     ghc-options: -Wall
 
+
+
+
 executable models-in-a-different-form
     -- Import common warning flags.
     import:           warnings
@@ -86,8 +89,11 @@ executable models-in-a-different-form
                       , optparse-applicative ^>= 0.18.1.0
                       , effectful-core
 
+
     -- Directories containing source files.
     hs-source-dirs:   app
 
     -- Base language which the package is written in.
     default-language: Haskell2010
+
+
