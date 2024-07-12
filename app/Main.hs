@@ -17,17 +17,15 @@ import qualified CodeWriter as CW
 import Control.Applicative ((<|>))
 import Control.Monad (unless, void, when)
 import Data.Bifunctor (first, second)
-import Data.Char (isAlpha, isAlphaNum)
 import Data.Either (partitionEithers)
 import Data.Foldable (fold, forM_)
-import Data.List (group, intercalate, intersperse, sort, transpose)
+import Data.List (group, intercalate, sort)
 import Data.List.Split
 import qualified Data.Map as M
 import Data.Maybe (catMaybes, maybeToList)
 import qualified Data.Set as S
 import qualified Data.Set as Set
 import Data.Traversable (forM)
-import Data.Void (Void)
 import Effectful
 import Effectful.Dispatch.Dynamic (reinterpret, send)
 import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError, tryError)
@@ -35,12 +33,11 @@ import Effectful.State.Static.Local (evalState, execState, gets, modify)
 import qualified Error.Diagnose as Diag
 import qualified Error.Diagnose.Compat.Megaparsec as Diag
 import qualified JSONExporter as JE
+import Lexer
 import System.IO (stderr)
 import Text.Earley hiding (namedToken)
-import Text.Megaparsec (Parsec)
 import qualified Text.Megaparsec as Mega
-import qualified Text.Megaparsec.Char as MegaChar
-import Text.Show.Pretty (pPrint)
+import Prelude hiding (lex)
 
 -- newtype Chemical = Chemical String deriving (Show)
 
@@ -151,132 +148,8 @@ expr = mdo
     tok' :: Token -> Prod r String (Spanned Token) (Spanned Token)
     tok' x = satisfy (\v -> x == unspanned v)
 
-data Token = Comment String | LBrace | RBrace | Ident String | ForwardsOp | BackwardsOp | BiOp | AddOp | Comma | VoidKw | LBrac | RBrac | LParen | RParen | EqOp deriving (Show, Eq)
-
-tokToSimple :: Token -> String
-tokToSimple (Comment _) = "a comment"
-tokToSimple LBrace = "{"
-tokToSimple RBrace = "}"
-tokToSimple (Ident _) = error "never call this, always have a better name"
-tokToSimple ForwardsOp = "==>"
-tokToSimple BackwardsOp = "<=="
-tokToSimple BiOp = "<==>"
-tokToSimple AddOp = "+"
-tokToSimple Comma = ","
-tokToSimple VoidKw = "void"
-tokToSimple LBrac = "["
-tokToSimple RBrac = "]"
-tokToSimple LParen = "("
-tokToSimple RParen = ")"
-tokToSimple EqOp = "="
-
-data Span = Span {line :: Int, startCol :: Int, endCol :: Int} deriving (Show)
-
-spanFromSourcePos :: Mega.SourcePos -> Mega.SourcePos -> Span
-spanFromSourcePos
-  (Mega.SourcePos _ sline scol)
-  (Mega.SourcePos _ eline ecol)
-    | sline == eline =
-        Span (Mega.unPos sline) (Mega.unPos scol) (Mega.unPos ecol)
-spanFromSourcePos _ _ = error "multiline span is not supported"
-
-class Spannable a where
-  computeSpan :: a -> Span
-
-instance Spannable (Spanned a) where
-  computeSpan (Spanned sp _) = sp
-
-data Spanned a = Spanned Span a deriving (Show)
-
-instance Semigroup Span where
-  (Span l1 s1 e1) <> (Span l2 s2 e2) | l1 == l2 = Span l1 (s1 `min` s2) (e1 `max` e2)
-  _ <> _ = error "ICE: You've encountered a compiler bug. spans are across several lines. this is not allowed"
-
-instance Functor Spanned where
-  fmap f (Spanned _span value) = Spanned _span (f value)
-
-instance Foldable Spanned where
-  foldMap f (Spanned _ value) = f value
-
-instance Traversable Spanned where
-  traverse f (Spanned _span value) = Spanned _span <$> f value
-
-unspanned :: Spanned a -> a
-unspanned (Spanned _ v) = v
-
-spanned :: LParser (a, Mega.SourcePos) -> LParser (Spanned a)
-spanned megaparser = do
-  start <- Mega.getSourcePos
-  (x, end) <- megaparser
-  pure (Spanned (spanFromSourcePos start end) x)
-
--- Consume whitespace following a lexeme, but record
--- its endpoint as being before the whitespace.
-lexeme :: LParser a -> LParser (a, Mega.SourcePos)
-lexeme megaparser = (,) <$> megaparser <*> (Mega.getSourcePos <* Mega.try MegaChar.hspace)
-
-spannedT :: LParser a -> LParser (Spanned a)
-spannedT = spanned . lexeme
-
-asIdent :: Token -> Maybe String
-asIdent (Ident contents) = Just contents
-asIdent _ = Nothing
-
-asNonTrivia :: Token -> Maybe Token
-asNonTrivia (Comment _) = Nothing
-asNonTrivia x = Just x
-
-type LParser = Parsec Void String
-
-lexer :: LParser [[Spanned Token]]
-lexer = (lex_lines `Mega.sepBy` MegaChar.newline) <* Mega.eof
-  where
-    lex_lines = Mega.many (spannedT keywords <|> spannedT structure <|> spannedT ident <|> spannedT op <|> spannedT (Mega.try comment))
-    keywords =
-      Mega.choice
-        [ VoidKw <$ MegaChar.string "void"
-        ]
-    structure =
-      Mega.choice
-        [ LBrace <$ MegaChar.char '{',
-          Comma <$ MegaChar.char ',',
-          RBrace <$ MegaChar.char '}',
-          LParen <$ MegaChar.char '(',
-          RParen <$ MegaChar.char ')',
-          LBrac <$ MegaChar.char '[',
-          RBrac <$ MegaChar.char ']'
-        ]
-
-    comment :: LParser Token
-    comment = Comment <$> (Mega.try MegaChar.hspace *> MegaChar.char '#' *> Mega.manyTill (Mega.satisfy $ const True) (Mega.lookAhead $ void MegaChar.eol <|> Mega.eof))
-
-    ident =
-      ( do
-          leading <- Mega.satisfy isAlpha
-          trailing <- Mega.many (Mega.satisfy (\x -> isAlphaNum x || x == '_'))
-
-          return $ Ident (leading : trailing)
-      )
-        Mega.<?> "chemical name or rate constant"
-
-    op =
-      Mega.choice
-        [ BiOp <$ MegaChar.string "<==>",
-          BackwardsOp <$ MegaChar.string "<==",
-          ForwardsOp <$ MegaChar.string "==>",
-          AddOp <$ MegaChar.string "+",
-          EqOp <$ MegaChar.string "="
-        ]
-
--- lexer :: String -> [String]
--- lexer [] = []
--- lexer contents = nextToken : (lexer . ignoreLeadingWS) rest
---   where
-
--- data LexDiag = LexDiag String;
-
-instance Diag.HasHints Void String where
-  hints _ = []
+-- instance Diag.HasHints Void String where
+--   hints _ = []
 
 filterRepetitions :: (a -> a -> Bool) -> [a] -> [a]
 filterRepetitions _ [] = []
@@ -473,59 +346,48 @@ semCommitIfErrs = void (send SemCommitIfErrs)
 semBuildError :: (SemanticErrorEff :> es) => Eff '[SemanticErrorBuilder] () -> (Eff es) ()
 semBuildError e = send (SemBuildError e)
 
-parseEquationText :: String -> IO [Equation]
-parseEquationText fname = do
-  text <- readFile fname
-  case Mega.parse lexer fname text of
-    Left bundle -> do
-      let diag = Diag.errorDiagnosticFromBundle Nothing "File Failed To Lex" Nothing bundle
-      let added = Diag.addFile diag fname text
-      void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle added
+-- instance HasHints Void msg where
+--   hints _ = mempty
 
-      return []
-    Right content -> do
-      let noTrivia = filter (not . null) $ catMaybes <$> (fmap . fmap) (traverse asNonTrivia) content
-      let parseExpr = fullParses (parser expr)
-      let parsedLines = parseExpr <$> noTrivia
-      -- pPrint content
-      let (eqns, reports) = unzip parsedLines
+parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) [Equation]
+parse fileName fileContents tokens = do
+  let parseExpr = fullParses (parser expr)
+  let parsedLines = parseExpr <$> tokens
+  let (eqns, reports) = unzip parsedLines
 
-      let badReports = filter (\v -> (not . null . expected . snd) v || (not . null . unconsumed . snd) v) (zip noTrivia reports)
+  let badReports = filter (\v -> (not . null . expected . snd) v || (not . null . unconsumed . snd) v) (zip tokens reports)
 
-      let diagnostic = Diag.addFile (mempty :: Diag.Diagnostic String) fname text
-      repos <- forM badReports $ \(errLine, Report pos expec _) -> do
-        let (linen, scol, ecol) =
-              if pos == length errLine
-                then
-                  let (Spanned (Span linen' _ ecol') _) = last errLine
-                   in (linen', ecol', ecol')
-                else
-                  let (Spanned (Span linen' scol' ecol') _) = errLine !! pos
-                   in (linen', scol', ecol')
+  let parsedDiagnostic = Diag.addFile (mempty :: Diag.Diagnostic String) fileName fileContents
+  repos <- forM badReports $ \(errLine, Report pos expec _) -> do
+    let (linen, scol, ecol) =
+          if pos == length errLine
+            then
+              let (Spanned (Span linen' _ ecol') _) = last errLine
+               in (linen', ecol', ecol')
+            else
+              let (Spanned (Span linen' scol' ecol') _) = errLine !! pos
+               in (linen', scol', ecol')
 
-        let expectedMessage = if null expec then "end of line was expected to be here" else "expected " ++ joinWithOr expec
+    let expectedMessage = if null expec then "end of line was expected to be here" else "expected " ++ joinWithOr expec
 
-        let parseErrorMessage = if all (null . unconsumed) reports then "Incomplete Equation ~ Equation ended before expected" else "Reaction couldn't be parsed"
-        let repo =
-              Diag.Err
-                (Just "while parsing")
-                parseErrorMessage
-                [ (Diag.Position (linen, scol) (linen, ecol) fname, Diag.This expectedMessage)
-                ]
-                []
+    let parseErrorMessage = if all (null . unconsumed) reports then "Incomplete Equation ~ Equation ended before expected" else "Reaction couldn't be parsed"
+    let repo =
+          Diag.Err
+            (Just "while parsing")
+            parseErrorMessage
+            [ (Diag.Position (linen, scol) (linen, ecol) fileName, Diag.This expectedMessage)
+            ]
+            []
 
-        return repo
+    return repo
 
-      let diagnostics = foldl Diag.addReport diagnostic repos
+  let diagnostics = foldl Diag.addReport parsedDiagnostic repos
 
-      -- let diag' = Diag.addReport diagnostic repo
-      void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle diagnostics
-
-      if null badReports
-        then do
-          let eqns' = head <$> eqns
-          return eqns'
-        else return []
+  if null badReports
+    then do
+      let eqns' = head <$> eqns
+      Right eqns'
+    else Left diagnostics
 
 data LiteralType = LiteralStateVar | LiteralParameter deriving (Show, Eq)
 
@@ -778,7 +640,6 @@ exportUsingASCII func export =
     (ExportLiteral _ str) -> str
     (ExportInt int) -> show int
     (ExportNeg str) -> "-" <> func' str
-    -- (ExportSum s) -> intercalate " + " $ func' <$> s
     (ExportSum s) ->
       concat $
         intersperseCondEither
@@ -1247,39 +1108,59 @@ basicMacroProvider =
 jsonExport :: String -> ResolvedVariableModel -> String
 jsonExport modelName (ResolvedVariableModel stateVars sysParams _dependent _eqns) = JE.toString $ JE.fromResolved modelName (typstLit <$> S.toList stateVars) (typstLit <$> S.toList sysParams)
 
+
+effEither :: (Error e :> es) => Either e a -> Eff es a
+effEither (Left diag) = throwError diag
+effEither (Right a) = return a
+
+
 main :: IO ()
 main = do
   opt <- Cli.cli
 
   case opt of
     Cli.SubcommandExport (Cli.ExportOpts filePath modelName exportFormat) -> do
-      modelEquations <- parseEquationText filePath
+      -- read in the file that we're loading from
       fileContents <- readFile filePath
 
+      -- now run the error recording effect monad
       res <- runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
+        -- add the file that we have
         semAddFile filePath fileContents
+        -- and let the state know that this is the file that
+        -- we're working with
         semActivateFile filePath
 
+        -- TODO: this is a bit of an leaky abstraction
+        -- that is using the Diagnostic type as our error
+        -- type, but this is nice and linear to read this way
+        -- so that is at least nice
+
+        -- now lex and then parse our equations file, of course, failing 
+        -- if either fails
+        modelEquations <- effEither $ do
+          lexed <- lex filePath fileContents
+          parse filePath fileContents lexed
+
+        -- convert them into "normal form"
         let normalForms = equationsToNormalForm modelEquations
 
         -- take the equations that are in normal form
         -- and resolve and expand their macros.
         resolved <- resolveEquations basicMacroProvider normalForms
 
+        -- just a convenience helper function for running a model exporter
         let runExporter model = CW.evalStringCodeWriter 4 (model modelName resolved)
 
         return
           ( case exportFormat of
               Cli.JSONExport -> jsonExport modelName resolved
               Cli.AsciiExport -> runExporter asciiExporter
-              Cli.JuliaExport ->  runExporter juliaExporter
-              Cli.TypstExport ->  runExporter typstExporter
+              Cli.JuliaExport -> runExporter juliaExporter
+              Cli.TypstExport -> runExporter typstExporter
           )
-      -- return $ jsonExport modelName resolved
       case res of
         Left err -> do
           void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
         Right success ->
           liftIO $ putStrLn success
-
-      return ()
