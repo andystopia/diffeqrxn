@@ -10,7 +10,6 @@ import Data.Void (Void)
 import qualified Error.Diagnose as Diag
 import Error.Diagnose.Compat.Megaparsec (HasHints)
 import qualified Error.Diagnose.Compat.Megaparsec as Diag
-import System.IO (stderr)
 import Text.Megaparsec hiding (Token)
 import Text.Megaparsec.Char
 

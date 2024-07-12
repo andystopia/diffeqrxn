@@ -9,6 +9,9 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use lambda-case" #-}
 
 module Main where
 
@@ -17,12 +20,12 @@ import qualified CodeWriter as CW
 import Control.Applicative ((<|>))
 import Control.Monad (unless, void, when)
 import Data.Bifunctor (first, second)
-import Data.Either (partitionEithers)
-import Data.Foldable (fold, forM_)
+import Data.Either (partitionEithers, lefts)
+import Data.Foldable (fold, forM_, sequenceA_, traverse_)
 import Data.List (group, intercalate, sort)
 import Data.List.Split
 import qualified Data.Map as M
-import Data.Maybe (catMaybes, maybeToList)
+import Data.Maybe (maybeToList)
 import qualified Data.Set as S
 import qualified Data.Set as Set
 import Data.Traversable (forM)
@@ -31,12 +34,10 @@ import Effectful.Dispatch.Dynamic (reinterpret, send)
 import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError, tryError)
 import Effectful.State.Static.Local (evalState, execState, gets, modify)
 import qualified Error.Diagnose as Diag
-import qualified Error.Diagnose.Compat.Megaparsec as Diag
 import qualified JSONExporter as JE
 import Lexer
 import System.IO (stderr)
 import Text.Earley hiding (namedToken)
-import qualified Text.Megaparsec as Mega
 import Prelude hiding (lex)
 
 -- newtype Chemical = Chemical String deriving (Show)
@@ -74,6 +75,7 @@ data Equation = Equation
   }
   deriving (Show)
 
+-- | lexer definition (evaluator)
 expr :: Grammar r (Prod r String (Spanned Token) Equation)
 expr = mdo
   rxn <- rule $ (chemicalRxnBi <|> chemicalRxnUni) <?> "a complete chemical reaction"
@@ -122,7 +124,7 @@ expr = mdo
   parameterName <- rule $ terminal asIdentS <?> "parameter name"
 
   arrayValue <- rule $ (:) <$> funcArgLit <* (tok' Comma <?> "a comma to introduce more list elements") <*> arrayValue <|> pure <$> funcArgLit
-  arrayValue' <- rule $ tok LBrac *> arrayValue <* tok RBrac <?> "list of chemicals & rate constants (i.e, [X, Y])"
+  arrayValue' <- rule $ tok' LBrac *> arrayValue <* tok' RBrac <?> "list of chemicals & rate constants (i.e, [X, Y])"
 
   argumentValue <- rule $ (ListArg <$> arrayValue') <|> (OnceArg <$> funcArgLit)
   kwValue <- rule $ Named <$> parameterName <* tok EqOp <*> argumentValue
@@ -254,7 +256,8 @@ runSemanticErrorBuilder = reinterpret (execState defaultSemErrorBuild) $ \_ -> \
 data SemanticErrorEffData = SemanticErrorEffData
   { diagnostic :: Diag.Diagnostic String,
     semCurrentFile :: String,
-    semErrCount :: Int
+    semErrCount :: Int,
+    semCurrentFiles :: [(String, String)]
   }
 
 data SemanticErrorEff :: Effect where
@@ -263,6 +266,7 @@ data SemanticErrorEff :: Effect where
   SemBuildError :: Eff '[SemanticErrorBuilder] () -> SemanticErrorEff m ()
   SemAddFile :: String -> String -> SemanticErrorEff m ()
   SemActivateFile :: String -> SemanticErrorEff m ()
+  SemSubscope :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> SemanticErrorEff m (Either (Diag.Diagnostic String) a)
   SemCommitIfErrs :: SemanticErrorEff m (Maybe a)
   SemCommit :: SemanticErrorEff m a
 
@@ -270,7 +274,7 @@ runSemanticErrorEff :: (Error (Diag.Diagnostic String) :> es) => Eff (SemanticEr
 runSemanticErrorEff = do
   let addReport repo = modify (\c -> c {diagnostic = diagnostic c `Diag.addReport` repo, semErrCount = semErrCount c + 1})
 
-  reinterpret (evalState (SemanticErrorEffData mempty "" 0)) $ \_ -> \case
+  reinterpret (evalState (SemanticErrorEffData mempty "" 0 [])) $ \_ -> \case
     SemPushError err -> do
       void $ addReport err
     SemBuildError err -> do
@@ -278,12 +282,21 @@ runSemanticErrorEff = do
       let err' = semErrorBuildIntoReport currentFile ((runPureEff . runSemanticErrorBuilder) err)
       void $ addReport err'
     SemAddFile file contents -> do
-      void $ modify (\c -> c {diagnostic = Diag.addFile (diagnostic c) file contents})
+      void $ modify (\c -> c {diagnostic = Diag.addFile (diagnostic c) file contents, semCurrentFiles = semCurrentFiles c ++ [(file, contents)]})
     SemActivateFile file -> do
       void $ modify (\c -> c {semCurrentFile = file})
     SemCommit -> do
       current <- gets diagnostic
       throwError current
+    SemSubscope eff -> do
+      files <- gets semCurrentFiles
+      curFile <- gets semCurrentFile
+      let res = runPureEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
+            forM_ files $ \(filepath, filename) -> do
+              semAddFile filepath filename
+            semActivateFile curFile
+            eff
+      return res
     SemPushDiagnostic diag -> do
       forM_ (Diag.reportsOf diag) $ \repo -> do
         void $ addReport repo
@@ -297,27 +310,19 @@ runSemanticErrorEff = do
 
 -- throwError current
 
-semSubscopeErr :: (Error (Diag.Diagnostic String) :> es) => Eff es c -> Eff es (Either (Diag.Diagnostic String) c)
-semSubscopeErr subscope = do
-  res <- tryError subscope
-  pure (first snd res)
+semSubscope :: (SemanticErrorEff :> es) => Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> (Eff es) (Either (Diag.Diagnostic String) a)
+semSubscope = send . SemSubscope
 
-runSemanticErrorEffFail :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> Either (Diag.Diagnostic String) a
-runSemanticErrorEffFail = runPureEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
+-- semSubscopeErr :: (Error (Diag.Diagnostic String) :> es) => Eff es c -> Eff es (Either (Diag.Diagnostic String) c)
+-- semSubscopeErr subscope = do
+--   res <- tryError subscope
+--   pure (first snd res)
 
 semLiftMaybe :: (SemanticErrorEff :> es) => Maybe a -> Eff '[SemanticErrorBuilder] () -> Eff es a
 semLiftMaybe (Just a) _ = pure a
 semLiftMaybe Nothing eff = do
   semBuildError eff
   semCommit
-
-data SemanticErrorEffFail :: Effect where
-  SemFailErr :: Eff '[SemanticErrorEff] () -> SemanticErrorEffFail m ()
-
-type instance DispatchOf SemanticErrorEffFail = Dynamic
-
-semFailErr :: (SemanticErrorEffFail :> es) => Eff '[SemanticErrorEff] () -> Eff es ()
-semFailErr x = send (SemFailErr x)
 
 semPushDiagnostic :: (SemanticErrorEff :> es) => Diag.Diagnostic String -> (Eff es) ()
 semPushDiagnostic e = send (SemPushDiagnostic e)
@@ -345,9 +350,6 @@ semCommitIfErrs = void (send SemCommitIfErrs)
 
 semBuildError :: (SemanticErrorEff :> es) => Eff '[SemanticErrorBuilder] () -> (Eff es) ()
 semBuildError e = send (SemBuildError e)
-
--- instance HasHints Void msg where
---   hints _ = mempty
 
 parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) [Equation]
 parse fileName fileContents tokens = do
@@ -579,10 +581,6 @@ exportASTToTypst' :: ExportAST -> String
 exportASTToTypst' export = case export of
   (ExportSum s) ->
     concat $
-      -- add typst newlines in equations
-      -- every 120 characters. This is a rough approximation
-      -- but it's at least a little more convenient than manually
-      -- adding them every time a variable is changed
       intercalateStringPeriodically 120 " \\ & " $
         intersperseCondEither
           func'
@@ -796,7 +794,7 @@ normalFormToAST me (SpeciesMacro rates func argSpan posArgs namedArgs) = do
 
 speciesNormalFormToExportAST :: (SemanticErrorEff :> es, Error (Diag.Diagnostic String) :> es) => MacroProvider -> [EquationNormalFormDef] -> Eff es (Either (Diag.Diagnostic String) ExportAST)
 speciesNormalFormToExportAST mp forms = do
-  allChildren <- traverse (semSubscopeErr <$> normalFormToAST mp) forms
+  allChildren <- traverse (semSubscope <$> normalFormToAST mp) forms
 
   pure $ do
     let (failures, successes) = partitionEithers allChildren
@@ -1108,11 +1106,31 @@ basicMacroProvider =
 jsonExport :: String -> ResolvedVariableModel -> String
 jsonExport modelName (ResolvedVariableModel stateVars sysParams _dependent _eqns) = JE.toString $ JE.fromResolved modelName (typstLit <$> S.toList stateVars) (typstLit <$> S.toList sysParams)
 
-
 effEither :: (Error e :> es) => Either e a -> Eff es a
 effEither (Left diag) = throwError diag
 effEither (Right a) = return a
 
+lintEquation :: (SemanticErrorEff :> es) => Equation -> (Eff es) Equation
+lintEquation (Equation func1@(Function {}) func2@(Function {}) _) = do
+  semBuildError $ do
+    semSetErrorCode "TWO_SIDED_MACRO"
+    semSetErrorMessage "Macros are only allowed one side of chemical reactions"
+    semAddMarker (computeSpan func1) (Diag.This "This macro...")
+    semAddMarker (computeSpan func2) (Diag.This "... and this macro cannot be on both sides")
+    semMakeIntoWarning
+  semCommit
+lintEquation (Equation (EqnVoids sp1) (EqnVoids sp2) _) = do
+  semBuildError $ do
+    semSetErrorCode "TWO_SIDED_VOID"
+    semSetErrorMessage "A void expression on both sides is functionally a no-op, and is not supported."
+    semAddMarker sp1 (Diag.This "This void...")
+    semAddMarker sp2 (Diag.This "... and this void cannot be on opposite sides")
+    semMakeIntoWarning
+  semCommit
+lintEquation eq = return eq
+
+semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String), IOE] a -> IO (Either (Diag.Diagnostic String) a)
+semanticErrorEffToEither = runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
 
 main :: IO ()
 main = do
@@ -1124,7 +1142,7 @@ main = do
       fileContents <- readFile filePath
 
       -- now run the error recording effect monad
-      res <- runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
+      res <- semanticErrorEffToEither $ do
         -- add the file that we have
         semAddFile filePath fileContents
         -- and let the state know that this is the file that
@@ -1136,12 +1154,24 @@ main = do
         -- type, but this is nice and linear to read this way
         -- so that is at least nice
 
-        -- now lex and then parse our equations file, of course, failing 
+        -- now lex and then parse our equations file, of course, failing
         -- if either fails
+
         modelEquations <- effEither $ do
           lexed <- lex filePath fileContents
           parse filePath fileContents lexed
 
+
+        lints <- fold . lefts <$> traverse (semSubscope . lintEquation) modelEquations
+
+        Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle lints
+
+
+        -- res <- traverse (semSubscopeErr . lintEquation) modelEquations
+
+        -- lint the equations
+
+        -- traverse_ lintEquation modelEquations
         -- convert them into "normal form"
         let normalForms = equationsToNormalForm modelEquations
 

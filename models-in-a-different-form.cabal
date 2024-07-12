@@ -68,7 +68,7 @@ executable models-in-a-different-form
     main-is:          Main.hs
 
     -- Modules included in this executable, other than Main.
-    other-modules: TypeChecker, CodeWriter, JSONExporter, ContainedParser, Cli, Lexer
+    other-modules: TypeChecker, CodeWriter, JSONExporter, ContainedParser, Cli, Lexer, AlgError
 
     -- LANGUAGE extensions used by modules in this package.
     -- other-extensions:
