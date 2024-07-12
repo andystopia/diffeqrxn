@@ -759,8 +759,8 @@ equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (EqnVoids _) cntrl
       BothRxn forwardRates backwardRates -> forwardRxn forwardRates ++ backwardRxn backwardRates
     else []
   where
-    forwardRxn rxnRates = [SpeciesUnit (SpeciesLost . unspanned <$> rxnRates)]
-    backwardRxn rxnRates = [SpeciesChemicals (SpeciesCreated . unspanned <$> rxnRates) (unspanned <$> lchems)]
+    forwardRxn rxnRates = [SpeciesChemicals (SpeciesLost . unspanned <$> rxnRates) (unspanned <$> lchems)]
+    backwardRxn rxnRates = [SpeciesUnit (SpeciesCreated . unspanned <$> rxnRates)]
 -- no op operation
 equationSpeciesToNormalForm _ (Equation (EqnVoids _) (EqnVoids _) _) = []
 equationSpeciesToNormalForm chem (Equation (EqnVoids _) (Chemicals rchems) cntrl) =
