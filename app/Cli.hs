@@ -13,7 +13,7 @@ exporterFormat =
   str >>= \case
     "typst" -> return TypstExport
     "julia" -> return JuliaExport
-    "json" -> return JuliaExport
+    "json" -> return JSONExport
     "ascii" -> return AsciiExport
     _ -> readerError "Accepted export formats are typst, json, julia, and ascii"
 

@@ -19,9 +19,11 @@ import qualified Cli
 import qualified CodeWriter as CW
 import Control.Applicative ((<|>))
 import Control.Monad (unless, void, when)
-import Data.Bifunctor (first, second)
-import Data.Either (partitionEithers, lefts)
+import Data.Bifunctor (Bifunctor (bimap), first, second)
+import Data.Either (lefts, partitionEithers)
 import Data.Foldable (fold, forM_, sequenceA_, traverse_)
+import Data.Function ((&))
+import Data.Functor ((<&>))
 import Data.List (group, intercalate, sort)
 import Data.List.Split
 import qualified Data.Map as M
@@ -29,6 +31,7 @@ import Data.Maybe (maybeToList)
 import qualified Data.Set as S
 import qualified Data.Set as Set
 import Data.Traversable (forM)
+import Data.Tuple (swap)
 import Effectful
 import Effectful.Dispatch.Dynamic (reinterpret, send)
 import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError, tryError)
@@ -75,12 +78,22 @@ data Equation = Equation
   }
   deriving (Show)
 
+data ModelVariableDeclaration = ImplicitInModel Span (Spanned String) | ComputedInModel Span (Spanned String)
+
+instance Spannable ModelVariableDeclaration where
+  computeSpan (ImplicitInModel sp var) = sp <> computeSpan var
+  computeSpan (ComputedInModel sp var) = sp <> computeSpan var
+
 -- | lexer definition (evaluator)
-expr :: Grammar r (Prod r String (Spanned Token) Equation)
+expr :: Grammar r (Prod r String (Spanned Token) (Either Equation ModelVariableDeclaration))
 expr = mdo
+  rxnOrVar <- rule $ (Right <$> implicit_rule <|> Right <$> explicit_rule <|> Left <$> rxn)
   rxn <- rule $ (chemicalRxnBi <|> chemicalRxnUni) <?> "a complete chemical reaction"
 
-  chemicalRxnBi <- rule $ Equation <$> eqnSide <*> (bidir *> eqnSide) <*> biRxnConstants <?> "bidireciton chemical reaction"
+  implicit_rule <- rule $ ImplicitInModel <$> tokSpan ImplicitKw <*> rateConstant <?> "implicit variable declaration"
+  explicit_rule <- rule $ ComputedInModel <$> tokSpan ComputedKw <*> rateConstant <?> "computed variable declaration"
+
+  chemicalRxnBi <- rule $ Equation <$> eqnSide <*> (bidir *> eqnSide) <*> biRxnConstants <?> "bidirectional chemical reaction"
   chemicalRxnUni <-
     rule
       $ (\left op right consts -> Equation left right (DirectionalRxn op consts))
@@ -137,7 +150,7 @@ expr = mdo
 
   function <- rule $ (\name (argspan, args) -> Function name argspan args) <$> functionName <*> argumentList'
 
-  return rxn
+  return rxnOrVar
   where
     asIdentS :: Spanned Token -> Maybe (Spanned String)
     asIdentS (Spanned sp unTok) = sequenceA $ Spanned sp (asIdent unTok)
@@ -149,9 +162,6 @@ expr = mdo
     tok x = satisfy (\v -> x == unspanned v) <?> tokToSimple x
     tok' :: Token -> Prod r String (Spanned Token) (Spanned Token)
     tok' x = satisfy (\v -> x == unspanned v)
-
--- instance Diag.HasHints Void String where
---   hints _ = []
 
 filterRepetitions :: (a -> a -> Bool) -> [a] -> [a]
 filterRepetitions _ [] = []
@@ -351,7 +361,7 @@ semCommitIfErrs = void (send SemCommitIfErrs)
 semBuildError :: (SemanticErrorEff :> es) => Eff '[SemanticErrorBuilder] () -> (Eff es) ()
 semBuildError e = send (SemBuildError e)
 
-parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) [Equation]
+parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) ([ModelVariableDeclaration], [Equation])
 parse fileName fileContents tokens = do
   let parseExpr = fullParses (parser expr)
   let parsedLines = parseExpr <$> tokens
@@ -388,7 +398,8 @@ parse fileName fileContents tokens = do
   if null badReports
     then do
       let eqns' = head <$> eqns
-      Right eqns'
+      let seperated = swap (partitionEithers eqns')
+      Right seperated
     else Left diagnostics
 
 data LiteralType = LiteralStateVar | LiteralParameter deriving (Show, Eq)
@@ -970,7 +981,7 @@ resolveEquations macroProvider normalForms = do
 -- typstExporter species definition = "(dif " <> exportASTToTypst (ExportLiteral LiteralStateVar species) <> ")/(dif t) &= " <> exportASTToTypst definition <> "\\"
 
 typstExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
-typstExporter _ (ResolvedVariableModel _stateVars _sysParams _dependent eqns) = do
+typstExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns) = do
   CW.scoped "$" $ do
     forM_ (M.toList eqns) $ \(species, definition) -> do
       CW.push $ "(dif " <> exportASTToTypst (ExportLiteral LiteralStateVar species) <> ")/(dif t) &= " <> (exportASTToTypst' . simpleExportAST) definition <> "\\"
@@ -979,16 +990,18 @@ typstExporter _ (ResolvedVariableModel _stateVars _sysParams _dependent eqns) = 
   return ()
 
 asciiExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
-asciiExporter _ (ResolvedVariableModel _stateVars _sysParams _dependent eqns) = do
+asciiExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns) = do
   forM_ (M.toList eqns) $ \(species, definition) -> do
     CW.push $ species <> " = " <> (exportToASCII . simpleExportAST) definition
 
 juliaExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
-juliaExporter modelName (ResolvedVariableModel stateVars sysParams _dependent eqns) = do
+juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed implicit _dependent eqns) = do
   let stateVarList = S.toList stateVars
-  let sysParamsList = S.toList sysParams
+  let sysParamsList = S.toList ((sysParams `S.union` implicit) S.\\ computed)
+  let computedParamsList = S.toList computed
 
   let paramStructName = modelName <> "Params"
+  let computedParamStructName = modelName <> "ComputedParams"
   let stateStructName = modelName <> "StateVars"
 
   CW.scoped ("@Base.kwdef struct " <> paramStructName) $ do
@@ -997,6 +1010,14 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams _dependent eq
 
   CW.push "end"
 
+  CW.newline
+
+  unless (null computed) $ do
+    CW.scoped ("struct " <> computedParamStructName) $ do
+      forM_ computedParamsList $ \var ->
+        CW.push var
+
+  CW.push "end"
   CW.newline
 
   CW.scoped ("function Base.convert(::Type{Vector}, s::" <> paramStructName <> ")") $ do
@@ -1049,22 +1070,30 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams _dependent eq
 
   CW.newline
 
+
+  let prefixer' = prefixer (\var -> if var `S.member` computed then "c." else "p.")
   -- I believe in Julia this is a valid definition for a differential equation
   -- because the type annotations will coerce the types into what you want them to be.
   CW.scoped ("function d" <> modelName <> "(sv, " <> "p::" <> paramStructName <> ", t)::Vector") $ do
     CW.push ("s::" <> stateStructName <> " = " <> "sv")
     forM_ stateVarList $ \stateVar -> do
-      CW.push ("d" <> stateVar <> " = " <> (exportASTToJulia . simpleExportAST $ (eqns M.! stateVar)))
+      CW.push ("d" <> stateVar <> " = " <> (exportASTToJulia prefixer' . simpleExportAST $ (eqns M.! stateVar)))
 
     CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) <$> stateVarList) ++ "]"
 
   CW.push "end"
 
   return ()
+  where
+    prefixer :: (String -> String) -> LiteralType -> String -> String
+    prefixer _ LiteralStateVar input = "s." <> input
+    prefixer grouper LiteralParameter input = grouper input <> input
 
 data ResolvedVariableModel = ResolvedVariableModel
   { resolvedStateVariables :: S.Set String,
     resolvedSystemParameters :: S.Set String,
+    computedSystemParameters :: S.Set String,
+    implicitSystemParameters :: S.Set String,
     -- | "dependent variables" are nodes which have
     -- | no dependencies.
     resolvedDependentStateVariables :: S.Set String,
@@ -1081,14 +1110,30 @@ resolvedModelFromEquations eqns =
    in ResolvedVariableModel
         { resolvedStateVariables = stateVars,
           resolvedSystemParameters = paramVars,
+          computedSystemParameters = S.empty,
+          implicitSystemParameters = S.empty,
           resolvedDependentStateVariables = stateVars S.\\ independentStateVars,
           resolvedEquations = eqns
         }
 
-exportASTToJulia :: ExportAST -> String
-exportASTToJulia (ExportLiteral LiteralParameter lit) = "p." <> lit
-exportASTToJulia (ExportLiteral LiteralStateVar lit) = "s." <> lit
-exportASTToJulia x = exportUsingASCII exportASTToJulia x
+qualifyResolvedVariables :: [ModelVariableDeclaration] -> ResolvedVariableModel -> ResolvedVariableModel
+qualifyResolvedVariables decls model =
+  let (implicit, computed) =
+        decls
+          <&> ( \x -> case x of
+                  ImplicitInModel _ var -> Left $ unspanned var
+                  ComputedInModel _ var -> Right $ unspanned var
+              )
+          & partitionEithers
+          & bimap S.fromList S.fromList
+   in model
+        { computedSystemParameters = computed,
+          implicitSystemParameters = implicit
+        }
+
+exportASTToJulia :: (LiteralType -> String -> String) -> ExportAST -> String
+exportASTToJulia prefixer (ExportLiteral littype lit) = prefixer littype lit
+exportASTToJulia prefixer x = exportUsingASCII (exportASTToJulia prefixer) x
 
 basicMacroProvider :: MacroProvider
 basicMacroProvider =
@@ -1104,7 +1149,7 @@ basicMacroProvider =
     (M.fromList [("HillSum", hillSumWrapper)])
 
 jsonExport :: String -> ResolvedVariableModel -> String
-jsonExport modelName (ResolvedVariableModel stateVars sysParams _dependent _eqns) = JE.toString $ JE.fromResolved modelName (typstLit <$> S.toList stateVars) (typstLit <$> S.toList sysParams)
+jsonExport modelName (ResolvedVariableModel stateVars sysParams _ _ _dependent _eqns) = JE.toString $ JE.fromResolved modelName (typstLit <$> S.toList stateVars) (typstLit <$> S.toList sysParams)
 
 effEither :: (Error e :> es) => Either e a -> Eff es a
 effEither (Left diag) = throwError diag
@@ -1132,6 +1177,10 @@ lintEquation eq = return eq
 semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String), IOE] a -> IO (Either (Diag.Diagnostic String) a)
 semanticErrorEffToEither = runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
 
+-- Let's design a good way to define a macro system right
+-- within Haskell which will make it easier to define macros
+
+
 main :: IO ()
 main = do
   opt <- Cli.cli
@@ -1157,27 +1206,26 @@ main = do
         -- now lex and then parse our equations file, of course, failing
         -- if either fails
 
-        modelEquations <- effEither $ do
+        (variableQualifiers, modelEquations) <- effEither $ do
           lexed <- lex filePath fileContents
           parse filePath fileContents lexed
-
 
         lints <- fold . lefts <$> traverse (semSubscope . lintEquation) modelEquations
 
         Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle lints
 
 
-        -- res <- traverse (semSubscopeErr . lintEquation) modelEquations
-
         -- lint the equations
 
-        -- traverse_ lintEquation modelEquations
         -- convert them into "normal form"
         let normalForms = equationsToNormalForm modelEquations
 
         -- take the equations that are in normal form
         -- and resolve and expand their macros.
-        resolved <- resolveEquations basicMacroProvider normalForms
+        resolvedNotQualified <- resolveEquations basicMacroProvider normalForms
+
+
+        let resolved = qualifyResolvedVariables variableQualifiers resolvedNotQualified
 
         -- just a convenience helper function for running a model exporter
         let runExporter model = CW.evalStringCodeWriter 4 (model modelName resolved)

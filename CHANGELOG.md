@@ -1,4 +1,4 @@
-# Revision history for models-in-a-different-form
+# Revision history for diffeqrxn
 
 ## 0.1.0.0 -- YYYY-mm-dd
 

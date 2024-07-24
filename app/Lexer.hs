@@ -29,10 +29,14 @@ data Token
   | LParen
   | RParen
   | EqOp
+  | ImplicitKw
+  | ComputedKw
   deriving (Show, Eq)
 
 tokToSimple :: Token -> String
 tokToSimple (Comment _) = "a comment"
+tokToSimple ImplicitKw = "'explicit'"
+tokToSimple ComputedKw = "'computed'"
 tokToSimple LBrace = "{"
 tokToSimple RBrace = "}"
 tokToSimple (Ident _) = error "never call this, always have a better name"
@@ -126,7 +130,10 @@ lexer = (lex_lines `sepBy` newline) <* eof
     lex_lines = many (spannedT keywords <|> spannedT structure <|> spannedT ident <|> spannedT op <|> spannedT (try comment))
     keywords =
       choice
-        [ VoidKw <$ string "void"
+        [ 
+          VoidKw <$ string "void",
+          ImplicitKw <$ string "implicit",
+          ComputedKw <$ string "computed"
         ]
     structure =
       choice
