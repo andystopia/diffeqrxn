@@ -62,7 +62,15 @@ executable diffeqrxn
     import:           warnings
     -- pgml impurity should be removable after: github.com/NixOS/nixpkgs/pull/317224
     -- merges and is on some stable version of the nixpkgs
-    ghc-options: -fplugin=Effectful.Plugin -pgml /usr/bin/cc
+
+    -- uncomment this if you want cabal repl to work. 
+    -- why this is is beyond my understanding, and apparently haskell.nix
+    -- has a pure nix way to implement this automatically, and then nix 
+    -- and the ghc team need to figure out something to make this work otherwise.
+    -- anyways, it has issues with build purity, so keep it commented 
+    -- for a real build
+
+    -- ghc-options: -fplugin=Effectful.Plugin -pgml /usr/bin/cc
 
     -- .hs or .lhs file containing the Main module.
     main-is:          Main.hs
