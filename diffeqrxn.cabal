@@ -83,7 +83,7 @@ executable diffeqrxn
 
     extra-libraries: stdc++
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.17.2.1
+    build-depends:    base ^>=4.18.2.1
                       , Earley ^>= 0.13.0.1
                       , text ^>= 2.0
                       , pretty-show ^>= 1.10

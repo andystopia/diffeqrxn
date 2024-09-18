@@ -41,13 +41,13 @@
           starship
           # put other package below
           cabal-install
-          haskell.compiler.ghc94
+          haskell.compiler.ghc96
           haskellPackages.implicit-hie
         ];
 
         nativeBuildInputs = with pkgs; [
-          haskell.compiler.ghc94
-          (haskell-language-server.override {supportedGhcVersions = ["94"];})
+          haskell.compiler.ghc96
+          haskell-language-server
         ];
 
         shellHook = "

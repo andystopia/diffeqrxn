@@ -6,7 +6,7 @@
 # actually compile this package
 {
   pkgs,
-  compiler ? "ghc94",
+  compiler ? "ghc96",
 }: let
   hpkgs = pkgs.haskell.packages.${compiler}.override {
     overrides = hself: hsuper: {
