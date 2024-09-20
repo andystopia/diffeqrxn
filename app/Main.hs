@@ -19,9 +19,9 @@ import qualified Cli
 import qualified CodeWriter as CW
 import Control.Applicative ((<|>))
 import Control.Monad (unless, void, when)
-import Data.Bifunctor (Bifunctor (bimap), first, second)
+import Data.Bifunctor (Bifunctor (bimap), second)
 import Data.Either (lefts, partitionEithers)
-import Data.Foldable (fold, forM_, sequenceA_, traverse_)
+import Data.Foldable (fold, forM_)
 import Data.Function ((&))
 import Data.Functor ((<&>))
 import Data.List (group, intercalate, sort)
@@ -30,25 +30,25 @@ import qualified Data.Map as M
 import Data.Maybe (maybeToList)
 import qualified Data.Set as S
 import qualified Data.Set as Set
+import qualified Data.Text as T
 import Data.Traversable (forM)
 import Data.Tuple (swap)
 import Effectful
-import Effectful.Dispatch.Dynamic (reinterpret, send)
-import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError, tryError)
-import Effectful.State.Static.Local (evalState, execState, gets, modify)
+import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError)
 import qualified Error.Diagnose as Diag
+import ErrorProvider
 import qualified JSONExporter as JE
 import Lexer
 import System.IO (stderr)
 import Text.Earley hiding (namedToken)
+import Text.Show.Pretty (pPrint)
+import TomlParamProvider (attemptDeserialize, getDefaultVariableLUT)
+import Utils
 import Prelude hiding (lex)
-
--- newtype Chemical = Chemical String deriving (Show)
 
 data EqnSide = Chemicals [Spanned String] | EqnVoids Span | Function (Spanned String) Span [FunctionArg] deriving (Show)
 
 instance Spannable EqnSide where
-  -- span :: a -> Span
   computeSpan (Chemicals strs) = foldr1 (<>) (computeSpan <$> strs)
   computeSpan (EqnVoids sp) = sp
   computeSpan (Function name argSpan _args) = computeSpan name <> argSpan
@@ -87,7 +87,7 @@ instance Spannable ModelVariableDeclaration where
 -- | lexer definition (evaluator)
 expr :: Grammar r (Prod r String (Spanned Token) (Either Equation ModelVariableDeclaration))
 expr = mdo
-  rxnOrVar <- rule $ (Right <$> implicit_rule <|> Right <$> explicit_rule <|> Left <$> rxn)
+  rxnOrVar <- rule (Right <$> implicit_rule <|> Right <$> explicit_rule <|> Left <$> rxn)
   rxn <- rule $ (chemicalRxnBi <|> chemicalRxnUni) <?> "a complete chemical reaction"
 
   implicit_rule <- rule $ ImplicitInModel <$> tokSpan ImplicitKw <*> rateConstant <?> "implicit variable declaration"
@@ -171,195 +171,6 @@ filterRepetitions cond (a : b : rest) = a : filterRepetitions cond (b : rest)
 
 filterRepeatedValue :: (Eq a) => (a -> Bool) -> [a] -> [a]
 filterRepeatedValue cond = filterRepetitions (\a b -> a == b && cond a)
-
-joinWithOr :: [String] -> String
-joinWithOr [] = ""
-joinWithOr [a] = a
-joinWithOr [a, b] = a <> " or " <> b
-joinWithOr [a, b, c] = a <> ", " <> b <> ", or " <> c
-joinWithOr (a : rest) = a <> ", " <> joinWithOr rest
-
-joinWithAnd :: [String] -> String
-joinWithAnd [] = ""
-joinWithAnd [a] = a
-joinWithAnd [a, b] = a <> " and " <> b
-joinWithAnd [a, b, c] = a <> ", " <> b <> ", and " <> c
-joinWithAnd (a : rest) = a <> ", " <> joinWithAnd rest
-
--- runErrorHandler :: Diag.Diagnostic String ->
-
-type instance DispatchOf SemanticErrorEff = Dynamic
-
-type instance DispatchOf SemanticErrorBuilder = Dynamic
-
-data SemanticErrorBuilder :: Effect where
-  SemSetErrorCode :: String -> SemanticErrorBuilder m ()
-  SemSetErrorMessage :: String -> SemanticErrorBuilder m ()
-  SemAddMarker :: Span -> Diag.Marker String -> SemanticErrorBuilder m ()
-  SemAddHint :: Diag.Note String -> SemanticErrorBuilder m ()
-  SemMakeIntoWarning :: SemanticErrorBuilder m ()
-  SemMakeError :: SemanticErrorBuilder m ()
-
-semSetErrorCode :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
-semSetErrorCode x = send (SemSetErrorCode x)
-
-semSetErrorMessage :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
-semSetErrorMessage x = send (SemSetErrorMessage x)
-
-semAddMarker :: (SemanticErrorBuilder :> es) => Span -> Diag.Marker String -> (Eff es) ()
-semAddMarker sp x = send (SemAddMarker sp x)
-
-semAddHint :: (SemanticErrorBuilder :> es) => Diag.Note String -> (Eff es) ()
-semAddHint x = send (SemAddHint x)
-
-semMakeIntoWarning :: (SemanticErrorBuilder :> es) => (Eff es) ()
-semMakeIntoWarning = send SemMakeIntoWarning
-
-semMakeError :: (SemanticErrorBuilder :> es) => (Eff es) ()
-semMakeError = send SemMakeError
-
-data SemErrorBuild = SemErrorBuild
-  { _errCode :: Maybe String,
-    _errMessage :: String,
-    _errMarkers :: [(Span, Diag.Marker String)],
-    _notes :: [Diag.Note String],
-    _isWarning :: Bool
-  }
-
-defaultSemErrorBuild :: SemErrorBuild
-defaultSemErrorBuild = SemErrorBuild Nothing "<an unknown error occurred>" [] [] False
-
--- we need to be able to have the file that we're currently focused on
--- to actually build this model.
-
-spanToPosition :: String -> Span -> Diag.Position
-spanToPosition filepath (Span spanLine spanStart spanEnd) = Diag.Position (spanLine, spanStart) (spanLine, spanEnd) filepath
-
-semErrorBuildIntoReport :: String -> SemErrorBuild -> Diag.Report String
-semErrorBuildIntoReport filepath (SemErrorBuild code msg markers notes isWarn) = (if isWarn then Diag.Warn else Diag.Err) code msg (first (spanToPosition filepath) <$> markers) notes
-
-runSemanticErrorBuilder :: Eff (SemanticErrorBuilder : es) a -> (Eff es) SemErrorBuild
-runSemanticErrorBuilder = reinterpret (execState defaultSemErrorBuild) $ \_ -> \case
-  SemSetErrorCode x -> do
-    modify (\c -> c {_errCode = Just x})
-    return ()
-  SemSetErrorMessage x -> do
-    modify (\c -> c {_errMessage = x})
-    return ()
-  SemAddMarker sp msg -> do
-    currentMarkers <- gets _errMarkers
-    let withAdditional = currentMarkers ++ [(sp, msg)]
-    modify (\c -> c {_errMarkers = withAdditional})
-    return ()
-  SemAddHint msg -> do
-    currentHints <- gets _notes
-    let withAdditional = currentHints ++ [msg]
-    modify (\c -> c {_notes = withAdditional})
-    return ()
-  SemMakeIntoWarning -> do
-    modify (\c -> c {_isWarning = True})
-    return ()
-  SemMakeError -> do
-    modify (\c -> c {_isWarning = False})
-    return ()
-
-data SemanticErrorEffData = SemanticErrorEffData
-  { diagnostic :: Diag.Diagnostic String,
-    semCurrentFile :: String,
-    semErrCount :: Int,
-    semCurrentFiles :: [(String, String)]
-  }
-
-data SemanticErrorEff :: Effect where
-  SemPushError :: Diag.Report String -> SemanticErrorEff m ()
-  SemPushDiagnostic :: Diag.Diagnostic String -> SemanticErrorEff m ()
-  SemBuildError :: Eff '[SemanticErrorBuilder] () -> SemanticErrorEff m ()
-  SemAddFile :: String -> String -> SemanticErrorEff m ()
-  SemActivateFile :: String -> SemanticErrorEff m ()
-  SemSubscope :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> SemanticErrorEff m (Either (Diag.Diagnostic String) a)
-  SemCommitIfErrs :: SemanticErrorEff m (Maybe a)
-  SemCommit :: SemanticErrorEff m a
-
-runSemanticErrorEff :: (Error (Diag.Diagnostic String) :> es) => Eff (SemanticErrorEff : es) a -> (Eff es) a
-runSemanticErrorEff = do
-  let addReport repo = modify (\c -> c {diagnostic = diagnostic c `Diag.addReport` repo, semErrCount = semErrCount c + 1})
-
-  reinterpret (evalState (SemanticErrorEffData mempty "" 0 [])) $ \_ -> \case
-    SemPushError err -> do
-      void $ addReport err
-    SemBuildError err -> do
-      currentFile <- gets semCurrentFile
-      let err' = semErrorBuildIntoReport currentFile ((runPureEff . runSemanticErrorBuilder) err)
-      void $ addReport err'
-    SemAddFile file contents -> do
-      void $ modify (\c -> c {diagnostic = Diag.addFile (diagnostic c) file contents, semCurrentFiles = semCurrentFiles c ++ [(file, contents)]})
-    SemActivateFile file -> do
-      void $ modify (\c -> c {semCurrentFile = file})
-    SemCommit -> do
-      current <- gets diagnostic
-      throwError current
-    SemSubscope eff -> do
-      files <- gets semCurrentFiles
-      curFile <- gets semCurrentFile
-      let res = runPureEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff $ do
-            forM_ files $ \(filepath, filename) -> do
-              semAddFile filepath filename
-            semActivateFile curFile
-            eff
-      return res
-    SemPushDiagnostic diag -> do
-      forM_ (Diag.reportsOf diag) $ \repo -> do
-        void $ addReport repo
-    SemCommitIfErrs -> do
-      current <- gets diagnostic
-      nErrs <- gets semErrCount
-
-      if nErrs /= 0
-        then throwError current
-        else pure Nothing
-
--- throwError current
-
-semSubscope :: (SemanticErrorEff :> es) => Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> (Eff es) (Either (Diag.Diagnostic String) a)
-semSubscope = send . SemSubscope
-
--- semSubscopeErr :: (Error (Diag.Diagnostic String) :> es) => Eff es c -> Eff es (Either (Diag.Diagnostic String) c)
--- semSubscopeErr subscope = do
---   res <- tryError subscope
---   pure (first snd res)
-
-semLiftMaybe :: (SemanticErrorEff :> es) => Maybe a -> Eff '[SemanticErrorBuilder] () -> Eff es a
-semLiftMaybe (Just a) _ = pure a
-semLiftMaybe Nothing eff = do
-  semBuildError eff
-  semCommit
-
-semPushDiagnostic :: (SemanticErrorEff :> es) => Diag.Diagnostic String -> (Eff es) ()
-semPushDiagnostic e = send (SemPushDiagnostic e)
-
-semLiftEitherDiag :: (SemanticErrorEff :> es, Error (Diag.Diagnostic String) :> es) => Either (Diag.Diagnostic String) k -> (Eff es) k
-semLiftEitherDiag (Right k) = return k
-semLiftEitherDiag (Left e) = do
-  semPushDiagnostic e
-  semCommit
-
-semPushError :: (SemanticErrorEff :> es) => Diag.Report String -> (Eff es) ()
-semPushError e = send (SemPushError e)
-
-semCommit :: (SemanticErrorEff :> es) => (Eff es) a
-semCommit = send SemCommit
-
-semAddFile :: (SemanticErrorEff :> es) => String -> String -> Eff es ()
-semAddFile name contents = send (SemAddFile name contents)
-
-semActivateFile :: (SemanticErrorEff :> es) => String -> Eff es ()
-semActivateFile name = send (SemActivateFile name)
-
-semCommitIfErrs :: (SemanticErrorEff :> es) => (Eff es) ()
-semCommitIfErrs = void (send SemCommitIfErrs)
-
-semBuildError :: (SemanticErrorEff :> es) => Eff '[SemanticErrorBuilder] () -> (Eff es) ()
-semBuildError e = send (SemBuildError e)
 
 parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) ([ModelVariableDeclaration], [Equation])
 parse fileName fileContents tokens = do
@@ -930,7 +741,6 @@ evaluateMacro :: MacroProvider -> String -> [FunctionArgValue] -> M.Map String F
 evaluateMacro _ name positional namedArgs = if name == "HillSum" then hillSumWrapper positional namedArgs else error "only the hillsum function is supported"
 
 equationToNormalForm :: Equation -> M.Map String [EquationNormalFormDef]
--- equationToNormalForm eqn = M.fromSet (`equationSpeciesToNormalForm` eqn) (chemicalNames eqn)
 equationToNormalForm eqn =
   let names = chemicalNamesAsList eqn
       unified = (group . sort) names
@@ -977,8 +787,6 @@ resolveEquations macroProvider normalForms = do
   equationResolved <- semLiftEitherDiag $ foldHashmapLeft converted
   return $ resolvedModelFromEquations equationResolved
 
--- typstExporter :: String -> ExportAST -> String
--- typstExporter species definition = "(dif " <> exportASTToTypst (ExportLiteral LiteralStateVar species) <> ")/(dif t) &= " <> exportASTToTypst definition <> "\\"
 
 typstExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
 typstExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns) = do
@@ -994,8 +802,8 @@ asciiExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns
   forM_ (M.toList eqns) $ \(species, definition) -> do
     CW.push $ species <> " = " <> (exportToASCII . simpleExportAST) definition
 
-juliaExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
-juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed implicit _dependent eqns) = do
+juliaExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (T.Text -> Maybe T.Text) -> (Eff es) ()
+juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed implicit _dependent eqns) defaultValueLookup = do
   let stateVarList = S.toList stateVars
   let sysParamsList = S.toList ((sysParams `S.union` implicit) S.\\ computed)
   let computedParamsList = S.toList computed
@@ -1006,14 +814,17 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.scoped ("@Base.kwdef struct " <> paramStructName) $ do
     forM_ sysParamsList $ \var -> do
-      CW.push var
+      let defaultValue = defaultValueLookup (T.pack var)
+      case defaultValue of
+        Just def_value -> CW.push $ var <> " = " <> (T.unpack def_value)
+        Nothing -> CW.push var
 
   CW.push "end"
 
   CW.newline
 
   unless (null computed) $ do
-    CW.scoped ("struct " <> computedParamStructName) $ do
+    CW.scoped ("@Base.kwdef struct " <> computedParamStructName) $ do
       forM_ computedParamsList $ \var ->
         CW.push var
 
@@ -1069,7 +880,6 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   CW.push "end"
 
   CW.newline
-
 
   let prefixer' = prefixer (\var -> if var `S.member` computed then "c." else "p.")
   -- I believe in Julia this is a valid definition for a differential equation
@@ -1177,8 +987,6 @@ lintEquation eq = return eq
 semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String), IOE] a -> IO (Either (Diag.Diagnostic String) a)
 semanticErrorEffToEither = runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
 
--- Let's design a good way to define a macro system right
--- within Haskell which will make it easier to define macros
 
 
 main :: IO ()
@@ -1186,12 +994,19 @@ main = do
   opt <- Cli.cli
 
   case opt of
-    Cli.SubcommandExport (Cli.ExportOpts filePath modelName exportFormat) -> do
-      -- read in the file that we're loading from
+    Cli.SubcommandExport (Cli.ExportOpts filePath modelName exportFormat paramsFile) -> do
+      -- read in the file that we're loading the equations from
       fileContents <- readFile filePath
 
       -- now run the error recording effect monad
       res <- semanticErrorEffToEither $ do
+        -- let's load in the parameters file
+        paramGetter <- traverse (`getDefaultVariableLUT` T.pack modelName) paramsFile
+
+        let paramProvider = case paramGetter of
+              Just x -> x
+              Nothing -> const Nothing
+
         -- add the file that we have
         semAddFile filePath fileContents
         -- and let the state know that this is the file that
@@ -1214,7 +1029,6 @@ main = do
 
         Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle lints
 
-
         -- lint the equations
 
         -- convert them into "normal form"
@@ -1223,7 +1037,6 @@ main = do
         -- take the equations that are in normal form
         -- and resolve and expand their macros.
         resolvedNotQualified <- resolveEquations basicMacroProvider normalForms
-
 
         let resolved = qualifyResolvedVariables variableQualifiers resolvedNotQualified
 
@@ -1234,7 +1047,7 @@ main = do
           ( case exportFormat of
               Cli.JSONExport -> jsonExport modelName resolved
               Cli.AsciiExport -> runExporter asciiExporter
-              Cli.JuliaExport -> runExporter juliaExporter
+              Cli.JuliaExport -> CW.evalStringCodeWriter 4 (juliaExporter modelName resolved paramProvider)
               Cli.TypstExport -> runExporter typstExporter
           )
       case res of
