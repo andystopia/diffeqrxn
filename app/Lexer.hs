@@ -1,17 +1,22 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Lexer where
 
 import Control.Monad (void)
 import Data.Char (isAlpha, isAlphaNum)
 import Data.Maybe (catMaybes)
-import Data.Void (Void)
 import qualified Error.Diagnose as Diag
 import Error.Diagnose.Compat.Megaparsec (HasHints)
 import qualified Error.Diagnose.Compat.Megaparsec as Diag
 import Text.Megaparsec hiding (Token)
 import Text.Megaparsec.Char
+import Effectful ((:>), Eff)
+import ErrorProvider
+import Utils (Spanned (Spanned), Span (Span))
+import Prelude hiding (lex)
 
 data Token
   = Comment String
@@ -54,8 +59,6 @@ tokToSimple LParen = "("
 tokToSimple RParen = ")"
 tokToSimple EqOp = "="
 
-data Span = Span {line :: Int, startCol :: Int, endCol :: Int} deriving (Show)
-
 spanFromSourcePos :: SourcePos -> SourcePos -> Span
 spanFromSourcePos
   (SourcePos _ sline scol)
@@ -63,38 +66,6 @@ spanFromSourcePos
     | sline == eline =
         Span (unPos sline) (unPos scol) (unPos ecol)
 spanFromSourcePos _ _ = error "multiline span is not supported"
-
-class Spannable a where
-  computeSpan :: a -> Span
-
-instance Spannable (Spanned a) where
-  computeSpan (Spanned sp _) = sp
-
-data Spanned a = Spanned Span a deriving (Show)
-
-instance Semigroup Span where
-  (Span l1 s1 e1) <> (Span l2 s2 e2) | l1 == l2 = Span l1 (s1 `min` s2) (e1 `max` e2)
-  _ <> _ = error "ICE: You've encountered a compiler bug. spans are across several lines. this is not allowed"
-
-instance Functor Spanned where
-  fmap f (Spanned _span value) = Spanned _span (f value)
-
-instance Foldable Spanned where
-  foldMap f (Spanned _ value) = f value
-
-instance Traversable Spanned where
-  traverse f (Spanned _span value) = Spanned _span <$> f value
-
-sequenceSpan :: [Spanned a] -> Spanned [a]
-sequenceSpan [] = error "cannot compute span on zero elements"
-sequenceSpan [Spanned sp v] = Spanned sp [v]
-sequenceSpan ((Spanned sp v) : rest) =
-  let (Spanned restSpan restEls) = sequenceSpan rest
-      fullSpan = sp <> restSpan
-   in Spanned fullSpan (v : restEls)
-
-unspanned :: Spanned a -> a
-unspanned (Spanned _ v) = v
 
 spanned :: LParser (a, SourcePos) -> LParser (Spanned a)
 spanned megaparser = do
@@ -118,14 +89,28 @@ asNonTrivia :: Token -> Maybe Token
 asNonTrivia (Comment _) = Nothing
 asNonTrivia x = Just x
 
-type LParser = Parsec Void String
+data ParsingErrorMessage = Nil deriving (Show, Eq, Ord);
 
-instance HasHints Void msg where
+type LParser = Parsec ParsingErrorMessage String
+
+
+instance HasHints ParsingErrorMessage msg where
   hints _ = mempty
 
+instance ShowErrorComponent ParsingErrorMessage where
+  showErrorComponent _ = error "we don't know what to show for error components"
+
+lexer :: (SemanticErrorEff :> es) => FilePath -> String -> (Eff es) [[Spanned Token]]
+lexer filePath text = do
+  case lex filePath text of
+      Left err -> do
+        semPushDiagnostic err
+        semCommit
+      Right x -> pure x
+      
 lex :: String -> String -> Either (Diag.Diagnostic String) [[Spanned Token]]
 lex filePath fileText =
-  case parse lexer filePath fileText of
+  case parse megalexer filePath fileText of
     Left bundle -> do
       let diag = Diag.errorDiagnosticFromBundle Nothing "File Failed To Lex" Nothing bundle
       let added = Diag.addFile diag filePath fileText
@@ -134,8 +119,8 @@ lex filePath fileText =
     Right content -> do
       Right $ filter (not . null) $ catMaybes <$> (fmap . fmap) (traverse asNonTrivia) content
 
-lexer :: LParser [[Spanned Token]]
-lexer = (lex_lines `sepBy` newline) <* eof
+megalexer :: LParser [[Spanned Token]]
+megalexer = (lex_lines `sepBy` newline) <* eof
   where
     lex_lines = many (spannedT keywords <|> spannedT structure <|> spannedT ident <|> spannedT op <|> spannedT (try comment))
     keywords =
