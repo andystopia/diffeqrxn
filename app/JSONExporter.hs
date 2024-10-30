@@ -3,10 +3,9 @@
 
 module JSONExporter (fromResolved, toString) where
 
-import Data.Aeson (ToJSON, encode)
+import Data.Aeson (ToJSON)
 import GHC.Generics
 import Data.Aeson.Text (encodeToLazyText)
-import qualified Data.Text.Lazy as T
 import qualified Data.Text.Lazy as TL
 
 data JSONVariable = JSONVariable

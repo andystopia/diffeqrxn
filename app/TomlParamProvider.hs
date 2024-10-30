@@ -12,8 +12,7 @@ module TomlParamProvider (getDefaultVariableLUT) where
 import Control.Monad (forM_)
 import qualified Data.Map.Strict as MS
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
-import Effectful (Eff, Effect, IOE, (:>))
+import Effectful (Eff, (:>))
 import ErrorProvider
 import GHC.Generics
 import Toml

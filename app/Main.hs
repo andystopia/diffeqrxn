@@ -4,7 +4,6 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -18,7 +17,7 @@ module Main where
 
 import qualified Cli
 import qualified CodeWriter as CW
-import Control.Applicative ((<|>))
+
 import Control.Monad (unless, void, when)
 import Data.Bifunctor (Bifunctor (bimap), second)
 import Data.Either (lefts, partitionEithers)
@@ -33,235 +32,17 @@ import qualified Data.Set as S
 import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-import Data.Tuple (swap)
 import Effectful
 import Effectful.Error.Dynamic (Error, runErrorNoCallStack)
 import qualified Error.Diagnose as Diag
 import ErrorProvider
 import Lexer
+import Parser
 import System.IO (stderr)
-import Text.Earley hiding (namedToken)
 import TomlParamProvider (getDefaultVariableLUT)
 import Utils
 import Prelude hiding (lex)
 
-newtype Parameter = Parameter String deriving (Show, Ord, Eq);
-
-data StateVariable = Monomer String | Polymer [String] deriving (Show, Ord, Eq)
-
-data EqnSide = Chemicals [Spanned StateVariable] | EqnVoids Span | Function (Spanned String) Span [FunctionArg] deriving (Show)
-
-instance Spannable EqnSide where
-  computeSpan (Chemicals strs) = foldr1 (<>) (computeSpan <$> strs)
-  computeSpan (EqnVoids sp) = sp
-  computeSpan (Function name argSpan _args) = computeSpan name <> argSpan
-
-data RxnDirection = BiRxn | Forwards | Backwards deriving (Show)
-
-data FunctionArg = Named (Spanned String) FunctionArgValue | Positional FunctionArgValue deriving (Show)
-
-instance Spannable FunctionArg where
-  computeSpan (Named name values) = computeSpan name <> computeSpan values
-  computeSpan (Positional value) = computeSpan value
-
-data FunctionArgDynamicVariable = FunctionArgEitherMonomerOrParameter String | FunctionArgPolymer [String] deriving Show;
-
-functionArgToStateVariable :: FunctionArgDynamicVariable -> StateVariable
-functionArgToStateVariable (FunctionArgEitherMonomerOrParameter arg) = Monomer arg
-functionArgToStateVariable (FunctionArgPolymer arg) = Polymer arg
-
-functionArgToParameter :: FunctionArgDynamicVariable -> Maybe Parameter
-functionArgToParameter (FunctionArgEitherMonomerOrParameter arg) = Just $ Parameter arg
-functionArgToParameter (FunctionArgPolymer _) = Nothing
-
-data FunctionArgValue = ListArg [Spanned FunctionArgDynamicVariable] | OnceArg (Spanned FunctionArgDynamicVariable) deriving (Show)
-
-instance Spannable FunctionArgValue where
-  computeSpan (ListArg els) = foldr1 (<>) (computeSpan <$> els)
-  computeSpan (OnceArg val) = computeSpan val
-
-data RxnControlDirection = ForwardRxn | BackwardsRxn deriving (Show)
-
-data RxnControl = DirectionalRxn RxnControlDirection [Spanned Parameter] | BothRxn [Spanned Parameter] [Spanned Parameter] deriving (Show)
-
-data Equation = Equation
-  { lhs :: EqnSide,
-    rhs :: EqnSide,
-    control :: RxnControl
-  }
-  deriving (Show)
-
-data ModelVariableDeclaration = ImplicitInModel Span (Spanned Parameter) | ComputedInModel Span (Spanned Parameter)
-
-instance Spannable ModelVariableDeclaration where
-  computeSpan (ImplicitInModel sp var) = sp <> computeSpan var
-  computeSpan (ComputedInModel sp var) = sp <> computeSpan var
-
-parseChemical :: Grammar r (Prod r String (Spanned Token) (Spanned StateVariable))
-parseChemical = mdo
-  nameLit <- rule $ terminal asIdentS <?> "chemical"
-  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit <|> pure <$> nameLit
-
-  return (merLitToStateVariable <$> merLit)
-  where
-    merLitToStateVariable :: [Spanned String] -> Spanned StateVariable
-    merLitToStateVariable [monomer] = Monomer <$> monomer
-    merLitToStateVariable poly =  Polymer <$> sequenceSpan poly
-
-parseMacroArgValue :: Grammar r (Prod r String (Spanned Token) (Spanned FunctionArgDynamicVariable))
-parseMacroArgValue = mdo
-  nameLit <- rule $ terminal asIdentS <?> "chemical"
-  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit <|> pure <$> nameLit
-
-  return (merLitToStateVariable <$> merLit)
-  where
-    merLitToStateVariable :: [Spanned String] -> Spanned FunctionArgDynamicVariable
-    merLitToStateVariable [monomer] = FunctionArgEitherMonomerOrParameter <$> monomer
-    merLitToStateVariable [] = error "somehow we parsed an empty chemical"
-    merLitToStateVariable poly =  FunctionArgPolymer <$> sequenceSpan poly
-
-merLit :: Grammar r (Prod r String (Spanned Token) (Spanned FunctionArgDynamicVariable))
-merLit = mdo
-  nameLit <- rule $ terminal asIdentS <?> "chemical or rate constant"
-  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit
-  return (toPolymer <$> merLit <?> "a polymer / dimer")
-  where
-    toPolymer :: [Spanned String] -> Spanned FunctionArgDynamicVariable
-    toPolymer elements =
-      let flipped = sequenceSpan elements
-       in FunctionArgPolymer <$> flipped
-
-functionGrammar :: Grammar r (Prod r String (Spanned Token) EqnSide)
-functionGrammar = mdo
-  chemicalOrParam <- parseMacroArgValue
-
-  -- function parsing
-  -- funcArgLit <- rule $ terminal asIdentS <?> "chemical or rate constant"
-  functionName <- rule $ terminal asIdentS <?> "the name of a function"
-  parameterName <- rule $ terminal asIdentS <?> "parameter name"
-
-  arrayValue <- rule $ (:) <$> chemicalOrParam <* (tok' Comma <?> "a comma to introduce more list elements") <*> arrayValue <|> pure <$> chemicalOrParam
-  arrayValue' <- rule $ tok' LBrac *> arrayValue <* tok' RBrac <?> "list of chemicals & rate constants (i.e, [X, Y])"
-
-  argumentValue <- rule $ (ListArg <$> arrayValue') <|> (OnceArg <$> chemicalOrParam)
-  kwValue <- rule $ Named <$> parameterName <* tok EqOp <*> argumentValue
-
-  argument <- rule $ kwValue <|> (Positional <$> argumentValue)
-
-  argumentList <- rule $ (:) <$> argument <* (tok' Comma <?> "a comma to introduce more function arguments") <*> argumentList <|> pure <$> argument
-
-  argumentList' <- rule $ (\l m r -> (l <> r, m)) <$> tokSpan LParen <*> argumentList <*> tokSpan RParen <?> "function arguments"
-
-  function <- rule $ (\name (argspan, args) -> Function name argspan args) <$> functionName <*> argumentList'
-  return function
-  where
-    toMonomer :: Spanned String -> Spanned FunctionArgDynamicVariable
-    toMonomer val = FunctionArgEitherMonomerOrParameter <$> val
-
-asIdentS :: Spanned Token -> Maybe (Spanned String)
-asIdentS (Spanned sp unTok) = sequenceA $ Spanned sp (asIdent unTok)
-
--- | lexer definition (ealuator)
-expr :: Grammar r (Prod r String (Spanned Token) (Either Equation ModelVariableDeclaration))
-expr = mdo
-  rxnOrVar <- rule (Right <$> implicit_rule <|> Right <$> explicit_rule <|> Left <$> rxn)
-  rxn <- rule $ (chemicalRxnBi <|> chemicalRxnUni) <?> "a complete chemical reaction"
-
-  implicit_rule <- rule $ ImplicitInModel <$> tokSpan ImplicitKw <*> rateConstant <?> "implicit variable declaration"
-  explicit_rule <- rule $ ComputedInModel <$> tokSpan ComputedKw <*> rateConstant <?> "computed variable declaration"
-
-  chemicalRxnBi <- rule $ Equation <$> eqnSide <*> (bidir *> eqnSide) <*> biRxnConstants <?> "bidirectional chemical reaction"
-  chemicalRxnUni <-
-    rule
-      $ (\left op right consts -> Equation left right (DirectionalRxn op consts))
-        <$> eqnSide
-        <*> unidir
-        <*> eqnSide
-        <*> uniRxnConstants
-      <?> "unidirectional rate constants"
-  eqnSide <- rule $ Chemicals <$> chemicals <|> ((EqnVoids <$> tokSpan VoidKw) <?> "one side of a chemical equation")  <|> function
-  chemicals <- rule $ ((:) <$> singleChem <* (tok' AddOp <?> "+ (for more chemicals)") <*> chemicals) <|> pure <$> singleChem <?> "a list of chemicals"
-
-  unidir <-
-    rule $
-      ForwardRxn <$ tok ForwardsOp
-        <|> BackwardsRxn <$ tok BackwardsOp
-
-  bidir <-
-    rule $
-      BiRxn <$ tok BiOp <?>
-        "<==>"
-
-  biRxnConstants <-
-    rule
-      $ BothRxn
-        <$> ( tok LBrace
-                *> (rateConstantsList <* (tok Comma <?> "a comma separator between rate constants"))
-            )
-        <*> (rateConstantsList <* tok RBrace)
-      <?> "rate constants (for example {f1, f2})"
-
-  uniRxnConstants <- rule $ tok LBrace *> rateConstantsList <* tok RBrace <?> "rate constants"
-
-  function <- functionGrammar
-
-  rateConstantsList <- rule $ (:) <$> rateConstant <* tok AddOp <*> rateConstantsList <|> pure <$> rateConstant <?> "rate constants"
-
-  rateConstant :: (Prod r String (Spanned Token) (Spanned Parameter)) <- rule $ terminal (asParameter . asIdentS) <?> "rate constant"
-  singleChem <- parseChemical
-
-  return rxnOrVar
-  where 
-    asParameter :: Maybe (Spanned String) -> Maybe (Spanned Parameter)
-    asParameter ident = do
-      v <- ident
-      return (Parameter <$> v)
-
-tokSpan :: Token -> Prod r String (Spanned Token) Span
-tokSpan x = computeSpan <$> tok x
-
-tok :: Token -> Prod r String (Spanned Token) (Spanned Token)
-tok x = satisfy (\v -> x == unspanned v) <?> tokToSimple x
-
-tok' :: Token -> Prod r String (Spanned Token) (Spanned Token)
-tok' x = satisfy (\v -> x == unspanned v)
-
-filterRepetitions :: (a -> a -> Bool) -> [a] -> [a]
-filterRepetitions _ [] = []
-filterRepetitions _ [x] = [x]
-filterRepetitions cond (a : b : rest) | cond a b = filterRepetitions cond (a : rest)
-filterRepetitions cond (a : b : rest) = a : filterRepetitions cond (b : rest)
-
-filterRepeatedValue :: (Eq a) => (a -> Bool) -> [a] -> [a]
-filterRepeatedValue cond = filterRepetitions (\a b -> a == b && cond a)
-
-parseNew :: (SemanticErrorEff :> es) => [[Spanned Token]] -> (Eff es) ([ModelVariableDeclaration], [Equation])
-parseNew tokens = do
-  let parseExpr = fullParses (parser expr)
-  let parsedLines = parseExpr <$> tokens
-  let (eqns, reports) = unzip parsedLines
-
-  -- so we're parsing line by line, and
-  -- what's happening here is we're zipping each line of
-  -- tokens, with each line of reports.
-  let badReports = filter (\v -> (not . null . expected . snd) v || (not . null . unconsumed . snd) v) (zip tokens reports)
-
-  forM_ badReports $ \(errLine, Report pos expec _) -> do
-    let expectedMessage = if null expec then "end of line was expected to be here" else "expected " ++ joinWithOr expec
-    let parseErrorMessage = if all (null . unconsumed) reports then "Incomplete Equation ~ Equation ended before expected" else "Reaction couldn't be parsed"
-
-    semBuildError $ do
-      semSetErrorCode "FAILED_PARSING"
-      semSetErrorMessage parseErrorMessage
-      semAddMarker (computeSpan (errLine !! pos)) (Diag.This expectedMessage)
-
-  semCommitIfErrs
-
-  let eqns' = head <$> eqns
-  let seperated = swap (partitionEithers eqns')
-  return seperated
-
-data LiteralType = LiteralStateVar | LiteralParameter deriving (Show, Eq)
 
 data ExportAST
   = ExportSum [ExportAST]
@@ -445,10 +226,10 @@ intercalateStringPeriodically maxLen inner list =
     intercalateStringPeriodicallyH :: Int -> Int -> String -> [String] -> [String]
     intercalateStringPeriodicallyH _ _ _ [] = []
     intercalateStringPeriodicallyH _ _ _ [a] = [a]
-    intercalateStringPeriodicallyH count maxLen inner (current : rest) =
+    intercalateStringPeriodicallyH count maxLen' inner' (current : rest) =
       if count + length current > maxLen
-        then [inner, current] ++ intercalateStringPeriodicallyH (length inner) maxLen inner rest
-        else current : intercalateStringPeriodicallyH (length current + count) maxLen inner rest
+        then [inner, current] ++ intercalateStringPeriodicallyH (length inner) maxLen' inner' rest
+        else current : intercalateStringPeriodicallyH (length current + count) maxLen' inner' rest
 
 exportASTToTypst' :: ExportAST -> String
 exportASTToTypst' export = case export of
@@ -561,7 +342,7 @@ data SpeciesChange a = SpeciesCreated a | SpeciesLost a deriving (Show)
 
 data EquationNormalFormDef
   = -- | we're either increasing (proportional to) by a given macro
-    SpeciesMacro {_rates :: [SpeciesChange Parameter], funcName :: Spanned String, argumentSpan :: Span, macroPositionalArguments :: [FunctionArgValue], macroNamedArguments :: M.Map String FunctionArgValue}
+    SpeciesMacro {_rates :: [SpeciesChange Parameter], funcName :: Spanned String, argumentSpan :: Span, macroPositionalArguments :: [MacroArgValue], macroNamedArguments :: M.Map String MacroArgValue}
   | -- | or (proportionally) due to the product of the sum of rates and the product of chemicals (concentrations)
     SpeciesChemicals {_rates :: [SpeciesChange Parameter], chemicals :: [StateVariable]}
   | -- | or we're just increasing / decreasing our derivative by a constant
@@ -578,7 +359,7 @@ data EquationNormalFormDef
 -- 1. Species on the right hand side of a forward equation are made at a rate the (sum of the rate constants) times (product of the left hand species)
 -- 2. Species on the left hand side of a forward equation are lost at a rate of the (sum of the rate constants) times (product of the left hand species)
 
-argumentsToPositionalAndNamed :: [FunctionArg] -> ([FunctionArgValue], M.Map String FunctionArgValue)
+argumentsToPositionalAndNamed :: [MacroArg] -> ([MacroArgValue], M.Map String MacroArgValue)
 argumentsToPositionalAndNamed args =
   second
     M.fromList
@@ -607,7 +388,7 @@ equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (Chemicals rchems)
 
     forwardRxn = handleForwardReaction chem (unspanned <$> lchems) (unspanned <$> rchems)
     backwardRxn = handleForwardReaction chem (unspanned <$> rchems) (unspanned <$> lchems)
-equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (Function name argSpan args) cntrl) =
+equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (Macro name argSpan args) cntrl) =
   if chem `elem` (unspanned <$> lchems)
     then case cntrl of
       DirectionalRxn ForwardRxn forwardRates -> [forwardRxn forwardRates]
@@ -618,7 +399,7 @@ equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (Function name arg
     forwardRxn rxnRates = SpeciesMacro (SpeciesLost . unspanned <$> rxnRates) name argSpan posArgs namedArgs
     backwardRxn rxnRates = SpeciesMacro (SpeciesCreated . unspanned <$> rxnRates) name argSpan posArgs namedArgs
     (posArgs, namedArgs) = argumentsToPositionalAndNamed args
-equationSpeciesToNormalForm chem (Equation (Function name argSpan args) (Chemicals rchems) cntrl) =
+equationSpeciesToNormalForm chem (Equation (Macro name argSpan args) (Chemicals rchems) cntrl) =
   if chem `elem` (unspanned <$> rchems)
     then case cntrl of
       DirectionalRxn ForwardRxn forwardRates -> [forwardRxn forwardRates]
@@ -655,9 +436,9 @@ equationSpeciesToNormalForm chem (Equation (EqnVoids _) (Chemicals rchems) cntrl
 -- I'm pretty sure these future cases aren't able to be encountered in normal flow,
 -- since each equation only reduces itself, and we don't call on functions where it's
 -- known that a species doesn't exist, so this is probably not possible to encounter at all.
-equationSpeciesToNormalForm _ (Equation (Function {}) (EqnVoids _) _) = error "Macros and the void cannot influence each other"
-equationSpeciesToNormalForm _ (Equation (EqnVoids _) (Function {}) _) = error "Macros and the void cannot influence each other"
-equationSpeciesToNormalForm _ (Equation (Function {}) (Function {}) _) = error "Two macros on opposite sides of the equation are not supported"
+equationSpeciesToNormalForm _ (Equation (Macro {}) (EqnVoids _) _) = error "Macros and the void cannot influence each other"
+equationSpeciesToNormalForm _ (Equation (EqnVoids _) (Macro {}) _) = error "Macros and the void cannot influence each other"
+equationSpeciesToNormalForm _ (Equation (Macro {}) (Macro {}) _) = error "Two macros on opposite sides of the equation are not supported"
 
 speciesChangeToAST :: SpeciesChange Parameter -> ExportAST
 speciesChangeToAST (SpeciesCreated species) = ExportParameter species
@@ -691,10 +472,10 @@ data MacroTypeDefinition = MacroTypeDefinition
 
 data MacroProvider = MacroProvider
   { macroTypeDecls :: M.Map String MacroTypeDefinition,
-    macroEvaluators :: M.Map String ([FunctionArgValue] -> M.Map String FunctionArgValue -> ExportAST)
+    macroEvaluators :: M.Map String ([MacroArgValue] -> M.Map String MacroArgValue -> ExportAST)
   }
 
-executeMacro :: (SemanticErrorEff :> es) => MacroProvider -> Spanned String -> Span -> [FunctionArgValue] -> M.Map String FunctionArgValue -> (Eff es) ExportAST
+executeMacro :: (SemanticErrorEff :> es) => MacroProvider -> Spanned String -> Span -> [MacroArgValue] -> M.Map String MacroArgValue -> (Eff es) ExportAST
 executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArguments = do
   (MacroTypeDefinition namedP positionP) <- semLiftMaybe (M.lookup name (macroTypeDecls macroProvider)) $ do
     semSetErrorCode "MACRO_SIG_NOT_FOUND"
@@ -777,7 +558,7 @@ hillSumMacro chems rate n =
 -- todo: once the AST has spanning information, we'll
 -- replace this with a real typechecking abstraction that reports
 -- errors on the AST
-hillSumWrapper :: [FunctionArgValue] -> M.Map String FunctionArgValue -> ExportAST
+hillSumWrapper :: [MacroArgValue] -> M.Map String MacroArgValue -> ExportAST
 hillSumWrapper positional named =
   case positional of
     [ListArg chems] ->
@@ -797,7 +578,7 @@ hillSumWrapper positional named =
         else error "HillSum called with the wrong number of named parameters"
     _ -> error "This is an error"
 
-evaluateMacro :: MacroProvider -> String -> [FunctionArgValue] -> M.Map String FunctionArgValue -> ExportAST
+evaluateMacro :: MacroProvider -> String -> [MacroArgValue] -> M.Map String MacroArgValue -> ExportAST
 evaluateMacro _ name positional namedArgs = if name == "HillSum" then hillSumWrapper positional namedArgs else error "only the hillsum function is supported"
 
 equationToNormalForm :: Equation -> M.Map StateVariable [EquationNormalFormDef]
@@ -870,7 +651,6 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   let paramStructName = modelName <> "Params"
   let computedParamStructName = modelName <> "ComputedParams"
   let stateStructName = modelName <> "StateVars"
-  let varToString = joinPolymer "__di__"
 
 
   CW.scoped ("@Base.kwdef struct " <> paramStructName) $ do
@@ -915,14 +695,14 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.scoped ("@Base.kwdef struct " <> stateStructName) $ do
     forM_ stateVarList $ \var -> do
-      CW.push  $ varToString var
+      CW.push  $ stateVarToJulia var
 
   CW.push "end"
 
   CW.newline
 
   CW.scoped ("function Base.convert(::Type{Vector}, s::" <> stateStructName <> ")") $ do
-    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) . varToString <$> stateVarList) ++ "]"
+    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) . stateVarToJulia <$> stateVarList) ++ "]"
 
   CW.push "end"
 
@@ -934,7 +714,7 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
     CW.indented $ do
       forM_ (zip stateVarList [1 :: Int ..]) $ \(var, idx) -> do
-        CW.push $ varToString var <> " = " <> "fromVec[" <> show idx <> "],"
+        CW.push $ stateVarToJulia var <> " = " <> "fromVec[" <> show idx <> "],"
 
     CW.push ")"
 
@@ -942,23 +722,26 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.newline
 
-  let prefixer' = prefixer (\var -> if Parameter var `S.member` computed then "c." else "p.")
+  let astParameterToJulia' var = parameterToJulia (if var `S.member` computed then "c." else "p.") var
+
   -- I believe in Julia this is a valid definition for a differential equation
   -- because the type annotations will coerce the types into what you want them to be.
   CW.scoped ("function d" <> modelName <> "(sv, " <> "p::" <> paramStructName <> ", t)::Vector") $ do
     CW.push ("s::" <> stateStructName <> " = " <> "sv")
     forM_ stateVarList $ \stateVar -> do
-      CW.push ("d" <> varToString stateVar <> " = " <> (exportASTToJulia prefixer' . simpleExportAST $ (eqns M.! stateVar)))
+      CW.push ("d" <> stateVarToJulia stateVar <> " = " <> (exportASTToJulia astParameterToJulia' stateVarToJulia. simpleExportAST $ (eqns M.! stateVar)))
 
-    CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) . varToString <$> stateVarList) ++ "]"
+    CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) . stateVarToJulia <$> stateVarList) ++ "]"
 
   CW.push "end"
 
   return ()
   where
-    prefixer :: (String -> String) -> LiteralType -> String -> String
-    prefixer _ LiteralStateVar input = "s." <> input
-    prefixer grouper LiteralParameter input = grouper input <> input
+    stateVarToJulia :: StateVariable -> String
+    stateVarToJulia sv = "s." <> joinPolymer "__di__" sv
+
+    parameterToJulia :: String -> Parameter -> String
+    parameterToJulia prefix (Parameter param)= prefix <> param
 
     parameterToString :: Parameter -> String
     parameterToString (Parameter p) = p
@@ -1005,10 +788,10 @@ qualifyResolvedVariables decls model =
           implicitSystemParameters = implicit
         }
 
-exportASTToJulia :: (LiteralType -> String -> String) -> ExportAST -> String
-exportASTToJulia prefixer (ExportStateVar stateVar) = prefixer LiteralStateVar (joinPolymer "__di__" stateVar)
-exportASTToJulia prefixer (ExportParameter (Parameter param)) = prefixer LiteralParameter  param
-exportASTToJulia prefixer x = exportUsingASCII (exportASTToJulia prefixer) x
+exportASTToJulia :: (Parameter -> String) -> (StateVariable -> String) -> ExportAST -> String
+exportASTToJulia _ stateVarToString (ExportStateVar stateVar) = stateVarToString stateVar
+exportASTToJulia paramToString _ (ExportParameter parameter) = paramToString parameter
+exportASTToJulia paramToString stateVarToString x = exportUsingASCII (exportASTToJulia paramToString stateVarToString) x
 
 basicMacroProvider :: MacroProvider
 basicMacroProvider =
@@ -1025,12 +808,12 @@ basicMacroProvider =
 
 
 lintEquation :: (SemanticErrorEff :> es) => Equation -> (Eff es) Equation
-lintEquation (Equation func1@(Function {}) func2@(Function {}) _) = do
+lintEquation (Equation macro1@(Macro {}) macro2@(Macro {}) _) = do
   semBuildError $ do
     semSetErrorCode "TWO_SIDED_MACRO"
     semSetErrorMessage "Macros are only allowed one side of chemical reactions"
-    semAddMarker (computeSpan func1) (Diag.This "This macro...")
-    semAddMarker (computeSpan func2) (Diag.This "... and this macro cannot be on both sides")
+    semAddMarker (computeSpan macro1) (Diag.This "This macro...")
+    semAddMarker (computeSpan macro2) (Diag.This "... and this macro cannot be on both sides")
     semMakeIntoWarning
   semCommit
 lintEquation (Equation (EqnVoids sp1) (EqnVoids sp2) _) = do
@@ -1054,7 +837,7 @@ data ProgramInput = ProgramInput
     inputExportFormat :: ExportFormat
   }
 
-runWithInput :: (SemanticErrorEff :> es) => ProgramInput -> (Eff es) T.Text
+runWithInput :: (SemanticErrorEff :> es) => ProgramInput -> (Eff es) (Diag.Diagnostic String, T.Text)
 runWithInput programInput = do
   let filePath = T.unpack $ inputModelFilename programInput
   let text = T.unpack $ inputModelText programInput
@@ -1073,7 +856,7 @@ runWithInput programInput = do
       semCommit
     Right x -> pure x
 
-  (variableQualifiers, modelEquations) <- parseNew lexed
+  (variableQualifiers, modelEquations) <- parse lexed
 
   lints <- fold . lefts <$> traverse (semSubscope . lintEquation) modelEquations
 
@@ -1090,7 +873,7 @@ runWithInput programInput = do
   let runExporter model = T.pack $ CW.evalStringCodeWriter 4 (model (T.unpack $ inputModelName programInput) resolved)
 
   return
-    ( case inputExportFormat programInput of
+    ( lints, case inputExportFormat programInput of
         AsciiExport -> runExporter asciiExporter
         JuliaExport -> T.pack $ CW.evalStringCodeWriter 4 (juliaExporter (T.unpack $ inputModelName programInput) resolved (inputParameterLookup programInput))
         TypstExport -> runExporter typstExporter
@@ -1128,5 +911,6 @@ main = do
         case res of
           Left err -> do
             void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
-          Right success ->
+          Right (lints, success) -> do
+            Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle lints
             putStrLn (T.unpack success)

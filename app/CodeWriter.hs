@@ -99,8 +99,8 @@ runStringCodeWriterEffL codeIndentSize = do
 
       let lineIndent = replicate (is * il) ' '
 
-      let indented = (lineIndent <>) <$> res
-      modify (\s -> s {codeLines = codeLines s ++ indented})
+      let indentedCode = (lineIndent <>) <$> res
+      modify (\s -> s {codeLines = codeLines s ++ indentedCode})
       return ()
     Push str -> do
       is <- gets indentSize
