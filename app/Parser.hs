@@ -28,10 +28,10 @@ import Text.Earley
 import ErrorProvider
 import Effectful ((:>), Eff)
 import Control.Monad (forM_)
-import Utils (joinWithOr)
+import Utils (joinWithOr, Spanned (Spanned), Span, Spannable (computeSpan), sequenceSpan, unspanned)
 import Data.Either (partitionEithers)
 import Data.Tuple (swap)
-import qualified Error.Diagnose as Diag
+
 
 newtype Parameter = Parameter String deriving (Show, Ord, Eq)
 
@@ -219,7 +219,7 @@ parse tokens = do
     semBuildError $ do
       semSetErrorCode "FAILED_PARSING"
       semSetErrorMessage parseErrorMessage
-      semAddMarker (computeSpan (errLine !! pos)) (Diag.This expectedMessage)
+      semAddMarker (computeSpan (errLine !! pos)) expectedMessage
 
   semCommitIfErrs
 
