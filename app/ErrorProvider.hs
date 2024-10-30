@@ -58,9 +58,11 @@ data SemanticErrorBuilder :: Effect where
 semSetErrorCode :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
 semSetErrorCode x = send (SemSetErrorCode x)
 
+-- | set the error message for this error
 semSetErrorMessage :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
 semSetErrorMessage x = send (SemSetErrorMessage x)
 
+-- | add a marker (diagnostic) to this error
 semAddMarker :: (SemanticErrorBuilder :> es) => Span -> Diag.Marker String -> (Eff es) ()
 semAddMarker sp x = send (SemAddMarker sp x)
 
@@ -182,10 +184,14 @@ semLiftMaybe Nothing eff = do
   semBuildError eff
   semCommit
 
+effEither :: (Error e :> es) => Either e a -> Eff es a
+effEither (Left diag) = throwError diag
+effEither (Right a) = return a
+
 semPushDiagnostic :: (SemanticErrorEff :> es) => Diag.Diagnostic String -> (Eff es) ()
 semPushDiagnostic e = send (SemPushDiagnostic e)
 
-semLiftEitherDiag :: (SemanticErrorEff :> es, Error (Diag.Diagnostic String) :> es) => Either (Diag.Diagnostic String) k -> (Eff es) k
+semLiftEitherDiag :: (SemanticErrorEff :> es) => Either (Diag.Diagnostic String) k -> (Eff es) k
 semLiftEitherDiag (Right k) = return k
 semLiftEitherDiag (Left e) = do
   semPushDiagnostic e

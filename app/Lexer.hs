@@ -30,6 +30,7 @@ data Token
   | RParen
   | EqOp
   | ImplicitKw
+  | MerBinding
   | ComputedKw
   deriving (Show, Eq)
 
@@ -40,6 +41,7 @@ tokToSimple ComputedKw = "'computed'"
 tokToSimple LBrace = "{"
 tokToSimple RBrace = "}"
 tokToSimple (Ident _) = error "never call this, always have a better name"
+tokToSimple MerBinding = ":"
 tokToSimple ForwardsOp = "==>"
 tokToSimple BackwardsOp = "<=="
 tokToSimple BiOp = "<==>"
@@ -82,6 +84,14 @@ instance Foldable Spanned where
 
 instance Traversable Spanned where
   traverse f (Spanned _span value) = Spanned _span <$> f value
+
+sequenceSpan :: [Spanned a] -> Spanned [a]
+sequenceSpan [] = error "cannot compute span on zero elements"
+sequenceSpan [Spanned sp v] = Spanned sp [v]
+sequenceSpan ((Spanned sp v) : rest) =
+  let (Spanned restSpan restEls) = sequenceSpan rest
+      fullSpan = sp <> restSpan
+   in Spanned fullSpan (v : restEls)
 
 unspanned :: Spanned a -> a
 unspanned (Spanned _ v) = v
@@ -130,8 +140,7 @@ lexer = (lex_lines `sepBy` newline) <* eof
     lex_lines = many (spannedT keywords <|> spannedT structure <|> spannedT ident <|> spannedT op <|> spannedT (try comment))
     keywords =
       choice
-        [ 
-          VoidKw <$ string "void",
+        [ VoidKw <$ string "void",
           ImplicitKw <$ string "implicit",
           ComputedKw <$ string "computed"
         ]
@@ -164,5 +173,8 @@ lexer = (lex_lines `sepBy` newline) <* eof
           BackwardsOp <$ string "<==",
           ForwardsOp <$ string "==>",
           AddOp <$ string "+",
-          EqOp <$ string "="
+          EqOp <$ string "=",
+          -- the `:` which creates
+          -- dimers, polymers, etc
+          MerBinding <$ string ":"
         ]

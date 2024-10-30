@@ -1,12 +1,13 @@
 {-# LANGUAGE LambdaCase #-}
 
 module Cli where
-import Paths_diffeqrxn (version)
-import Data.Version (showVersion)
+-- import Paths_diffeqrxn (version)
+-- import Data.Version (showVersion)
 
 import Options.Applicative
 
-data ExportFormat = JuliaExport | JSONExport | TypstExport | AsciiExport deriving Show
+import Utils
+import qualified Data.Text as T
 
 newtype Subcommand = SubcommandExport ExportOpts deriving Show
 
@@ -15,13 +16,11 @@ exporterFormat =
   str >>= \case
     "typst" -> return TypstExport
     "julia" -> return JuliaExport
-    "json" -> return JSONExport
     "ascii" -> return AsciiExport
-    _ -> readerError "Accepted export formats are typst, json, julia, and ascii"
-
+    _ -> readerError "Accepted export formats are typst, julia, and ascii"
 data ExportOpts = ExportOpts
   { inputFile :: String,
-    modelName :: String,
+    modelName :: T.Text,
     exportFormat :: ExportFormat,
     paramsFile :: Maybe String
   } deriving Show
@@ -43,10 +42,10 @@ cliParser =
             )
             )
    in info
-        (parser <**> helper <**> simpleVersioner (showVersion version))
+        (parser <**> helper)
         ( fullDesc
             <> header "Mass Action Kinetics Exploratory Model Builder"
-            <> footer ("Version: " <> showVersion version)
+            -- <> footer ("Version: " <> showVersion version)
             <> progDesc "This program takes a model file (rxn) and can convert it to a number of defined formats. This makes it so that models have less copy and paste or just errors from typing them in, because the model writer can write down models piecewise, and only has to update one definition rather than multiple (in the case of writing down differential equations)"
         )
 

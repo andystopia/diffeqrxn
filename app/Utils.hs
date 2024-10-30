@@ -1,6 +1,8 @@
 module Utils where
 
 
+data ExportFormat = JuliaExport |  TypstExport | AsciiExport deriving Show;
+
 joinWithOr :: [String] -> String
 joinWithOr [] = ""
 joinWithOr [a] = a

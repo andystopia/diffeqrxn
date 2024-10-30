@@ -7,7 +7,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
-module TomlParamProvider (attemptDeserialize, getDefaultVariableLUT) where
+module TomlParamProvider (getDefaultVariableLUT) where
 
 import Control.Monad (forM_)
 import qualified Data.Map.Strict as MS
@@ -115,9 +115,9 @@ instance HasCodec SystemVariables where
 parameterSetsCodec :: TomlCodec SystemVariables
 parameterSetsCodec = genericCodec
 
-getDefaultVariableLUT :: (SemanticErrorEff :> es, IOE :> es) => FilePath -> T.Text -> (Eff es) (T.Text -> Maybe T.Text)
-getDefaultVariableLUT fp modelName = do
-  contents <- Toml.decodeFileEither parameterSetsCodec fp
+getDefaultVariableLUT :: (SemanticErrorEff :> es) =>  T.Text -> T.Text -> (Eff es) (T.Text -> Maybe T.Text)
+getDefaultVariableLUT modelName modelText = do
+  let contents = Toml.decode parameterSetsCodec modelText
 
   case contents of
     Left failure -> do
@@ -156,15 +156,3 @@ getDefaultVariableLUT fp modelName = do
         Right (ParameterLookup innerMap) -> do
           return (`MS.lookup` innerMap)
 
-attemptDeserialize :: IO ParameterLookup
-attemptDeserialize = do
-  contents <- Toml.decodeFileEither parameterSetsCodec "models/params.toml"
-
-  case contents of
-    Left errs -> do
-      TIO.putStrLn $ Toml.prettyTomlDecodeErrors errs
-      error "failed to deserialize toml"
-    Right param -> do
-      case lookupParameterSet param "DarkDimerDirect" of
-        Left failure -> (error . show) failure
-        Right success -> return success

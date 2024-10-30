@@ -12,6 +12,7 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use lambda-case" #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Main where
 
@@ -27,26 +28,28 @@ import Data.Functor ((<&>))
 import Data.List (group, intercalate, sort)
 import Data.List.Split
 import qualified Data.Map as M
-import Data.Maybe (maybeToList)
+import Data.Maybe (fromMaybe, maybeToList, fromJust)
 import qualified Data.Set as S
 import qualified Data.Set as Set
 import qualified Data.Text as T
-import Data.Traversable (forM)
+import qualified Data.Text.IO as TIO
 import Data.Tuple (swap)
 import Effectful
-import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError)
+import Effectful.Error.Dynamic (Error, runErrorNoCallStack)
 import qualified Error.Diagnose as Diag
 import ErrorProvider
-import qualified JSONExporter as JE
 import Lexer
 import System.IO (stderr)
 import Text.Earley hiding (namedToken)
-import Text.Show.Pretty (pPrint)
-import TomlParamProvider (attemptDeserialize, getDefaultVariableLUT)
+import TomlParamProvider (getDefaultVariableLUT)
 import Utils
 import Prelude hiding (lex)
 
-data EqnSide = Chemicals [Spanned String] | EqnVoids Span | Function (Spanned String) Span [FunctionArg] deriving (Show)
+newtype Parameter = Parameter String deriving (Show, Ord, Eq);
+
+data StateVariable = Monomer String | Polymer [String] deriving (Show, Ord, Eq)
+
+data EqnSide = Chemicals [Spanned StateVariable] | EqnVoids Span | Function (Spanned String) Span [FunctionArg] deriving (Show)
 
 instance Spannable EqnSide where
   computeSpan (Chemicals strs) = foldr1 (<>) (computeSpan <$> strs)
@@ -61,7 +64,17 @@ instance Spannable FunctionArg where
   computeSpan (Named name values) = computeSpan name <> computeSpan values
   computeSpan (Positional value) = computeSpan value
 
-data FunctionArgValue = ListArg [Spanned String] | OnceArg (Spanned String) deriving (Show)
+data FunctionArgDynamicVariable = FunctionArgEitherMonomerOrParameter String | FunctionArgPolymer [String] deriving Show;
+
+functionArgToStateVariable :: FunctionArgDynamicVariable -> StateVariable
+functionArgToStateVariable (FunctionArgEitherMonomerOrParameter arg) = Monomer arg
+functionArgToStateVariable (FunctionArgPolymer arg) = Polymer arg
+
+functionArgToParameter :: FunctionArgDynamicVariable -> Maybe Parameter
+functionArgToParameter (FunctionArgEitherMonomerOrParameter arg) = Just $ Parameter arg
+functionArgToParameter (FunctionArgPolymer _) = Nothing
+
+data FunctionArgValue = ListArg [Spanned FunctionArgDynamicVariable] | OnceArg (Spanned FunctionArgDynamicVariable) deriving (Show)
 
 instance Spannable FunctionArgValue where
   computeSpan (ListArg els) = foldr1 (<>) (computeSpan <$> els)
@@ -69,7 +82,7 @@ instance Spannable FunctionArgValue where
 
 data RxnControlDirection = ForwardRxn | BackwardsRxn deriving (Show)
 
-data RxnControl = DirectionalRxn RxnControlDirection [Spanned String] | BothRxn [Spanned String] [Spanned String] deriving (Show)
+data RxnControl = DirectionalRxn RxnControlDirection [Spanned Parameter] | BothRxn [Spanned Parameter] [Spanned Parameter] deriving (Show)
 
 data Equation = Equation
   { lhs :: EqnSide,
@@ -78,13 +91,77 @@ data Equation = Equation
   }
   deriving (Show)
 
-data ModelVariableDeclaration = ImplicitInModel Span (Spanned String) | ComputedInModel Span (Spanned String)
+data ModelVariableDeclaration = ImplicitInModel Span (Spanned Parameter) | ComputedInModel Span (Spanned Parameter)
 
 instance Spannable ModelVariableDeclaration where
   computeSpan (ImplicitInModel sp var) = sp <> computeSpan var
   computeSpan (ComputedInModel sp var) = sp <> computeSpan var
 
--- | lexer definition (evaluator)
+parseChemical :: Grammar r (Prod r String (Spanned Token) (Spanned StateVariable))
+parseChemical = mdo
+  nameLit <- rule $ terminal asIdentS <?> "chemical"
+  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit <|> pure <$> nameLit
+
+  return (merLitToStateVariable <$> merLit)
+  where
+    merLitToStateVariable :: [Spanned String] -> Spanned StateVariable
+    merLitToStateVariable [monomer] = Monomer <$> monomer
+    merLitToStateVariable poly =  Polymer <$> sequenceSpan poly
+
+parseMacroArgValue :: Grammar r (Prod r String (Spanned Token) (Spanned FunctionArgDynamicVariable))
+parseMacroArgValue = mdo
+  nameLit <- rule $ terminal asIdentS <?> "chemical"
+  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit <|> pure <$> nameLit
+
+  return (merLitToStateVariable <$> merLit)
+  where
+    merLitToStateVariable :: [Spanned String] -> Spanned FunctionArgDynamicVariable
+    merLitToStateVariable [monomer] = FunctionArgEitherMonomerOrParameter <$> monomer
+    merLitToStateVariable [] = error "somehow we parsed an empty chemical"
+    merLitToStateVariable poly =  FunctionArgPolymer <$> sequenceSpan poly
+
+merLit :: Grammar r (Prod r String (Spanned Token) (Spanned FunctionArgDynamicVariable))
+merLit = mdo
+  nameLit <- rule $ terminal asIdentS <?> "chemical or rate constant"
+  merLit <- rule $ (:) <$> (nameLit <* tok' MerBinding) <*> merLit
+  return (toPolymer <$> merLit <?> "a polymer / dimer")
+  where
+    toPolymer :: [Spanned String] -> Spanned FunctionArgDynamicVariable
+    toPolymer elements =
+      let flipped = sequenceSpan elements
+       in FunctionArgPolymer <$> flipped
+
+functionGrammar :: Grammar r (Prod r String (Spanned Token) EqnSide)
+functionGrammar = mdo
+  chemicalOrParam <- parseMacroArgValue
+
+  -- function parsing
+  -- funcArgLit <- rule $ terminal asIdentS <?> "chemical or rate constant"
+  functionName <- rule $ terminal asIdentS <?> "the name of a function"
+  parameterName <- rule $ terminal asIdentS <?> "parameter name"
+
+  arrayValue <- rule $ (:) <$> chemicalOrParam <* (tok' Comma <?> "a comma to introduce more list elements") <*> arrayValue <|> pure <$> chemicalOrParam
+  arrayValue' <- rule $ tok' LBrac *> arrayValue <* tok' RBrac <?> "list of chemicals & rate constants (i.e, [X, Y])"
+
+  argumentValue <- rule $ (ListArg <$> arrayValue') <|> (OnceArg <$> chemicalOrParam)
+  kwValue <- rule $ Named <$> parameterName <* tok EqOp <*> argumentValue
+
+  argument <- rule $ kwValue <|> (Positional <$> argumentValue)
+
+  argumentList <- rule $ (:) <$> argument <* (tok' Comma <?> "a comma to introduce more function arguments") <*> argumentList <|> pure <$> argument
+
+  argumentList' <- rule $ (\l m r -> (l <> r, m)) <$> tokSpan LParen <*> argumentList <*> tokSpan RParen <?> "function arguments"
+
+  function <- rule $ (\name (argspan, args) -> Function name argspan args) <$> functionName <*> argumentList'
+  return function
+  where
+    toMonomer :: Spanned String -> Spanned FunctionArgDynamicVariable
+    toMonomer val = FunctionArgEitherMonomerOrParameter <$> val
+
+asIdentS :: Spanned Token -> Maybe (Spanned String)
+asIdentS (Spanned sp unTok) = sequenceA $ Spanned sp (asIdent unTok)
+
+-- | lexer definition (ealuator)
 expr :: Grammar r (Prod r String (Spanned Token) (Either Equation ModelVariableDeclaration))
 expr = mdo
   rxnOrVar <- rule (Right <$> implicit_rule <|> Right <$> explicit_rule <|> Left <$> rxn)
@@ -102,7 +179,7 @@ expr = mdo
         <*> eqnSide
         <*> uniRxnConstants
       <?> "unidirectional rate constants"
-  eqnSide <- rule $ Chemicals <$> chemicals <|> ((EqnVoids <$> tokSpan VoidKw) <?> "one side of a chemical equation") <|> function
+  eqnSide <- rule $ Chemicals <$> chemicals <|> ((EqnVoids <$> tokSpan VoidKw) <?> "one side of a chemical equation")  <|> function
   chemicals <- rule $ ((:) <$> singleChem <* (tok' AddOp <?> "+ (for more chemicals)") <*> chemicals) <|> pure <$> singleChem <?> "a list of chemicals"
 
   unidir <-
@@ -126,42 +203,28 @@ expr = mdo
 
   uniRxnConstants <- rule $ tok LBrace *> rateConstantsList <* tok RBrace <?> "rate constants"
 
+  function <- functionGrammar
+
   rateConstantsList <- rule $ (:) <$> rateConstant <* tok AddOp <*> rateConstantsList <|> pure <$> rateConstant <?> "rate constants"
 
-  singleChem <- rule $ terminal asIdentS <?> "a chemical"
-  rateConstant <- rule $ terminal asIdentS <?> "rate constant"
-
-  -- function parsing
-  funcArgLit <- rule $ terminal asIdentS <?> "chemical or rate constant"
-  functionName <- rule $ terminal asIdentS <?> "the name of a function"
-  parameterName <- rule $ terminal asIdentS <?> "parameter name"
-
-  arrayValue <- rule $ (:) <$> funcArgLit <* (tok' Comma <?> "a comma to introduce more list elements") <*> arrayValue <|> pure <$> funcArgLit
-  arrayValue' <- rule $ tok' LBrac *> arrayValue <* tok' RBrac <?> "list of chemicals & rate constants (i.e, [X, Y])"
-
-  argumentValue <- rule $ (ListArg <$> arrayValue') <|> (OnceArg <$> funcArgLit)
-  kwValue <- rule $ Named <$> parameterName <* tok EqOp <*> argumentValue
-
-  argument <- rule $ kwValue <|> (Positional <$> argumentValue)
-
-  argumentList <- rule $ (:) <$> argument <* (tok' Comma <?> "a comma to introduce more function arguments") <*> argumentList <|> pure <$> argument
-
-  argumentList' <- rule $ (\l m r -> (l <> r, m)) <$> tokSpan LParen <*> argumentList <*> tokSpan RParen <?> "function arguments"
-
-  function <- rule $ (\name (argspan, args) -> Function name argspan args) <$> functionName <*> argumentList'
+  rateConstant :: (Prod r String (Spanned Token) (Spanned Parameter)) <- rule $ terminal (asParameter . asIdentS) <?> "rate constant"
+  singleChem <- parseChemical
 
   return rxnOrVar
-  where
-    asIdentS :: Spanned Token -> Maybe (Spanned String)
-    asIdentS (Spanned sp unTok) = sequenceA $ Spanned sp (asIdent unTok)
+  where 
+    asParameter :: Maybe (Spanned String) -> Maybe (Spanned Parameter)
+    asParameter ident = do
+      v <- ident
+      return (Parameter <$> v)
 
-    tokSpan :: Token -> Prod r String (Spanned Token) Span
-    tokSpan x = computeSpan <$> tok x
+tokSpan :: Token -> Prod r String (Spanned Token) Span
+tokSpan x = computeSpan <$> tok x
 
-    tok :: Token -> Prod r String (Spanned Token) (Spanned Token)
-    tok x = satisfy (\v -> x == unspanned v) <?> tokToSimple x
-    tok' :: Token -> Prod r String (Spanned Token) (Spanned Token)
-    tok' x = satisfy (\v -> x == unspanned v)
+tok :: Token -> Prod r String (Spanned Token) (Spanned Token)
+tok x = satisfy (\v -> x == unspanned v) <?> tokToSimple x
+
+tok' :: Token -> Prod r String (Spanned Token) (Spanned Token)
+tok' x = satisfy (\v -> x == unspanned v)
 
 filterRepetitions :: (a -> a -> Bool) -> [a] -> [a]
 filterRepetitions _ [] = []
@@ -172,46 +235,31 @@ filterRepetitions cond (a : b : rest) = a : filterRepetitions cond (b : rest)
 filterRepeatedValue :: (Eq a) => (a -> Bool) -> [a] -> [a]
 filterRepeatedValue cond = filterRepetitions (\a b -> a == b && cond a)
 
-parse :: FilePath -> String -> [[Spanned Token]] -> Either (Diag.Diagnostic String) ([ModelVariableDeclaration], [Equation])
-parse fileName fileContents tokens = do
+parseNew :: (SemanticErrorEff :> es) => [[Spanned Token]] -> (Eff es) ([ModelVariableDeclaration], [Equation])
+parseNew tokens = do
   let parseExpr = fullParses (parser expr)
   let parsedLines = parseExpr <$> tokens
   let (eqns, reports) = unzip parsedLines
 
+  -- so we're parsing line by line, and
+  -- what's happening here is we're zipping each line of
+  -- tokens, with each line of reports.
   let badReports = filter (\v -> (not . null . expected . snd) v || (not . null . unconsumed . snd) v) (zip tokens reports)
 
-  let parsedDiagnostic = Diag.addFile (mempty :: Diag.Diagnostic String) fileName fileContents
-  repos <- forM badReports $ \(errLine, Report pos expec _) -> do
-    let (linen, scol, ecol) =
-          if pos == length errLine
-            then
-              let (Spanned (Span linen' _ ecol') _) = last errLine
-               in (linen', ecol', ecol')
-            else
-              let (Spanned (Span linen' scol' ecol') _) = errLine !! pos
-               in (linen', scol', ecol')
-
+  forM_ badReports $ \(errLine, Report pos expec _) -> do
     let expectedMessage = if null expec then "end of line was expected to be here" else "expected " ++ joinWithOr expec
-
     let parseErrorMessage = if all (null . unconsumed) reports then "Incomplete Equation ~ Equation ended before expected" else "Reaction couldn't be parsed"
-    let repo =
-          Diag.Err
-            (Just "while parsing")
-            parseErrorMessage
-            [ (Diag.Position (linen, scol) (linen, ecol) fileName, Diag.This expectedMessage)
-            ]
-            []
 
-    return repo
+    semBuildError $ do
+      semSetErrorCode "FAILED_PARSING"
+      semSetErrorMessage parseErrorMessage
+      semAddMarker (computeSpan (errLine !! pos)) (Diag.This expectedMessage)
 
-  let diagnostics = foldl Diag.addReport parsedDiagnostic repos
+  semCommitIfErrs
 
-  if null badReports
-    then do
-      let eqns' = head <$> eqns
-      let seperated = swap (partitionEithers eqns')
-      Right seperated
-    else Left diagnostics
+  let eqns' = head <$> eqns
+  let seperated = swap (partitionEithers eqns')
+  return seperated
 
 data LiteralType = LiteralStateVar | LiteralParameter deriving (Show, Eq)
 
@@ -221,7 +269,8 @@ data ExportAST
   | ExportDiv ExportAST ExportAST
   | ExportPow ExportAST ExportAST
   | ExportProd [ExportAST]
-  | ExportLiteral LiteralType String
+  | ExportParameter Parameter
+  | ExportStateVar StateVariable
   | ExportInt Int
   deriving (Show)
 
@@ -232,7 +281,8 @@ fixExportAST f (ExportDiv num denom) = ExportDiv (f num) (f denom)
 fixExportAST f (ExportPow a b) = ExportPow (f a) (f b)
 fixExportAST f (ExportProd els) = ExportSum (f <$> els)
 -- base cases
-fixExportAST _ lit@(ExportLiteral _ _) = lit
+fixExportAST _ lit@(ExportParameter _) = lit
+fixExportAST _ lit@(ExportStateVar _) = lit
 fixExportAST _ lit@(ExportInt _) = lit
 
 -- | essentially is a first step towards bubbling
@@ -293,19 +343,19 @@ fixExportASTMonoid f (ExportPow a b) = f a <> f b
 fixExportASTMonoid f (ExportProd els) = foldMap f els
 -- \| you should almost definitely catch these base cases
 -- \| but otherwise you'll just keep getting the mempty out
-fixExportASTMonoid _ (ExportLiteral _ _) = mempty
+fixExportASTMonoid _ (ExportParameter _) = mempty
+fixExportASTMonoid _ (ExportStateVar _) = mempty
 fixExportASTMonoid _ (ExportInt _) = mempty
 
--- retrieve all the variables which are either
--- state variables or not state variables (depending on the parameter)
--- passed from the AST
-exportASTGetVariables :: LiteralType -> ExportAST -> S.Set String
-exportASTGetVariables
-  littype
-  (ExportLiteral lit literal)
-    | lit == littype =
-        S.singleton literal
-exportASTGetVariables lit ast = fixExportASTMonoid (exportASTGetVariables lit) ast
+
+exportASTGetStateVars :: ExportAST -> S.Set StateVariable
+exportASTGetStateVars (ExportStateVar var) = S.singleton var
+exportASTGetStateVars ast = fixExportASTMonoid exportASTGetStateVars ast
+
+exportASTGetParameters :: ExportAST -> S.Set Parameter
+exportASTGetParameters (ExportParameter var) = S.singleton var
+exportASTGetParameters ast = fixExportASTMonoid exportASTGetParameters ast
+
 
 exportASTOperatorImportance :: ExportAST -> Int
 exportASTOperatorImportance (ExportSum _) = 1
@@ -313,7 +363,8 @@ exportASTOperatorImportance (ExportNeg _) = 2
 exportASTOperatorImportance (ExportDiv _ _) = 2
 exportASTOperatorImportance (ExportProd _) = 2
 exportASTOperatorImportance (ExportPow _ _) = 3
-exportASTOperatorImportance (ExportLiteral _ _) = 1000
+exportASTOperatorImportance (ExportParameter _) = 1000
+exportASTOperatorImportance (ExportStateVar _) = 1000
 exportASTOperatorImportance (ExportInt _) = 1000
 
 -- I think the rule is if we have encoded a PROD[a, SUM[b, c]]
@@ -380,8 +431,8 @@ mapSeparateFirst inj _ [v] = [inj v]
 mapSeparateFirst inj mapper (a : rest) = inj a : (mapper <$> rest)
 
 exportASTToTypst :: ExportAST -> String
-exportASTToTypst (ExportLiteral LiteralParameter lit) = intercalate "_" (typstLit <$> splitOn "_" lit)
-exportASTToTypst (ExportLiteral LiteralStateVar lit) = typstLit lit
+exportASTToTypst (ExportParameter (Parameter text)) = intercalate "_" (typstLit <$> splitOn "_" text)
+exportASTToTypst (ExportStateVar lit) = typstLit (joinPolymer ":" lit)
 exportASTToTypst export@(ExportProd p) = intercalate " dot.c " $ func' <$> p
   where
     func' = exportASTGroupMaybeASCII exportASTToTypst export
@@ -454,10 +505,15 @@ fromEither :: Either a a -> a
 fromEither (Left v) = v
 fromEither (Right v) = v
 
+joinPolymer :: String -> StateVariable -> String
+joinPolymer _ (Monomer i) = i
+joinPolymer x (Polymer polys) = intercalate x polys
+
 exportUsingASCII :: (ExportAST -> String) -> ExportAST -> String
 exportUsingASCII func export =
   case export of
-    (ExportLiteral _ str) -> str
+    (ExportStateVar ident) -> joinPolymer "__di__" ident
+    (ExportParameter (Parameter param)) -> param
     (ExportInt int) -> show int
     (ExportNeg str) -> "-" <> func' str
     (ExportSum s) ->
@@ -485,17 +541,17 @@ exportToASCII = exportUsingASCII exportToASCII
 
 -- | Extract the unique chemical names out of a set of equations.
 -- (Note: does not currently include )
-allChemicalNames :: [Equation] -> [String]
+allChemicalNames :: [Equation] -> [StateVariable]
 allChemicalNames eqns = Set.toList $ foldMap chemicalNames eqns
 
 -- | Extract the chemical names from a single equation
-chemicalNames :: Equation -> Set.Set String
+chemicalNames :: Equation -> Set.Set StateVariable
 chemicalNames (Equation (Chemicals left) (Chemicals right) _) = Set.fromList (unspanned <$> left) <> Set.fromList (unspanned <$> right)
 chemicalNames (Equation (Chemicals left) _ _) = Set.fromList (unspanned <$> left)
 chemicalNames (Equation _ (Chemicals right) _) = Set.fromList (unspanned <$> right)
 chemicalNames _ = Set.empty
 
-chemicalNamesAsList :: Equation -> [String]
+chemicalNamesAsList :: Equation -> [StateVariable]
 chemicalNamesAsList (Equation (Chemicals left) (Chemicals right) _) = (unspanned <$> left) <> (unspanned <$> right)
 chemicalNamesAsList (Equation (Chemicals left) _ _) = unspanned <$> left
 chemicalNamesAsList (Equation _ (Chemicals right) _) = unspanned <$> right
@@ -505,11 +561,11 @@ data SpeciesChange a = SpeciesCreated a | SpeciesLost a deriving (Show)
 
 data EquationNormalFormDef
   = -- | we're either increasing (proportional to) by a given macro
-    SpeciesMacro {_rates :: [SpeciesChange String], funcName :: Spanned String, argumentSpan :: Span, macroPositionalArguments :: [FunctionArgValue], macroNamedArguments :: M.Map String FunctionArgValue}
+    SpeciesMacro {_rates :: [SpeciesChange Parameter], funcName :: Spanned String, argumentSpan :: Span, macroPositionalArguments :: [FunctionArgValue], macroNamedArguments :: M.Map String FunctionArgValue}
   | -- | or (proportionally) due to the product of the sum of rates and the product of chemicals (concentrations)
-    SpeciesChemicals {_rates :: [SpeciesChange String], chemicals :: [String]}
+    SpeciesChemicals {_rates :: [SpeciesChange Parameter], chemicals :: [StateVariable]}
   | -- | or we're just increasing / decreasing our derivative by a constant
-    SpeciesUnit {_rates :: [SpeciesChange String]}
+    SpeciesUnit {_rates :: [SpeciesChange Parameter]}
   deriving (Show)
 
 -- a <==> a + b {kf, kr} -> a => a + b {kr} and a <= a + b {kf}
@@ -536,14 +592,14 @@ argumentsToPositionalAndNamed args =
         )
     )
 
-equationSpeciesToNormalForm :: String -> Equation -> [EquationNormalFormDef]
+equationSpeciesToNormalForm :: StateVariable -> Equation -> [EquationNormalFormDef]
 equationSpeciesToNormalForm chem (Equation (Chemicals lchems) (Chemicals rchems) cntrl) =
   case cntrl of
     DirectionalRxn ForwardRxn forwardRates -> forwardRxn (unspanned <$> forwardRates)
     DirectionalRxn BackwardsRxn backwardRates -> backwardRxn (unspanned <$> backwardRates)
     BothRxn forwardRates backwardRates -> forwardRxn (unspanned <$> forwardRates) ++ backwardRxn (unspanned <$> backwardRates)
   where
-    handleForwardReaction :: String -> [String] -> [String] -> [String] -> [EquationNormalFormDef]
+    handleForwardReaction :: StateVariable -> [StateVariable] -> [StateVariable] -> [Parameter] -> [EquationNormalFormDef]
     handleForwardReaction ch lch rch rxnRates =
       let whenOnLeft = if ch `elem` lch then Just (SpeciesChemicals (SpeciesLost <$> rxnRates) lch) else Nothing
           whenOnRight = if ch `elem` rch then Just (SpeciesChemicals (SpeciesCreated <$> rxnRates) lch) else Nothing
@@ -603,18 +659,18 @@ equationSpeciesToNormalForm _ (Equation (Function {}) (EqnVoids _) _) = error "M
 equationSpeciesToNormalForm _ (Equation (EqnVoids _) (Function {}) _) = error "Macros and the void cannot influence each other"
 equationSpeciesToNormalForm _ (Equation (Function {}) (Function {}) _) = error "Two macros on opposite sides of the equation are not supported"
 
-speciesChangeToAST :: SpeciesChange String -> ExportAST
-speciesChangeToAST (SpeciesCreated species) = ExportLiteral LiteralParameter species
-speciesChangeToAST (SpeciesLost species) = ExportNeg (ExportLiteral LiteralParameter species)
+speciesChangeToAST :: SpeciesChange Parameter -> ExportAST
+speciesChangeToAST (SpeciesCreated species) = ExportParameter species
+speciesChangeToAST (SpeciesLost species) = ExportNeg (ExportParameter species)
 
 normalFormToAST :: (SemanticErrorEff :> es) => MacroProvider -> EquationNormalFormDef -> Eff es ExportAST
 normalFormToAST _ (SpeciesUnit rxnRates) = pure $ ExportSum (speciesChangeToAST <$> rxnRates)
-normalFormToAST _ (SpeciesChemicals rates chems) = pure $ ExportProd [ExportSum (speciesChangeToAST <$> rates), ExportProd (ExportLiteral LiteralStateVar <$> chems)]
+normalFormToAST _ (SpeciesChemicals rates chems) = pure $ ExportProd [ExportSum (speciesChangeToAST <$> rates), ExportProd (ExportStateVar <$> chems)]
 normalFormToAST me (SpeciesMacro rates func argSpan posArgs namedArgs) = do
   macroEval <- executeMacro me func argSpan posArgs namedArgs
   pure $ ExportProd [ExportSum (speciesChangeToAST <$> rates), macroEval]
 
-speciesNormalFormToExportAST :: (SemanticErrorEff :> es, Error (Diag.Diagnostic String) :> es) => MacroProvider -> [EquationNormalFormDef] -> Eff es (Either (Diag.Diagnostic String) ExportAST)
+speciesNormalFormToExportAST :: (SemanticErrorEff :> es) => MacroProvider -> [EquationNormalFormDef] -> Eff es (Either (Diag.Diagnostic String) ExportAST)
 speciesNormalFormToExportAST mp forms = do
   allChildren <- traverse (semSubscope <$> normalFormToAST mp) forms
 
@@ -713,10 +769,10 @@ executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArg
 
   return $ evalProvider positionArgs namedArguments
 
-hillSumMacro :: [String] -> String -> String -> ExportAST
+hillSumMacro :: [StateVariable] -> Parameter -> Parameter -> ExportAST
 hillSumMacro chems rate n =
-  let powAST = ExportPow (ExportSum (ExportLiteral LiteralStateVar <$> chems)) (ExportLiteral LiteralParameter n)
-   in ExportDiv powAST (ExportSum [ExportPow (ExportLiteral LiteralParameter rate) (ExportLiteral LiteralParameter n), powAST])
+  let powAST = ExportPow (ExportSum (ExportStateVar <$> chems)) (ExportParameter n)
+   in ExportDiv powAST (ExportSum [ExportPow (ExportParameter rate) (ExportParameter n), powAST])
 
 -- todo: once the AST has spanning information, we'll
 -- replace this with a real typechecking abstraction that reports
@@ -732,7 +788,11 @@ hillSumWrapper positional named =
                 n <- M.lookup "n" named
                 return (rate, n)
            in case both of
-                Just (OnceArg rate, OnceArg n) -> hillSumMacro (unspanned <$> chems) (unspanned rate) (unspanned n)
+                -- TODO: I'm pretty sure that my SEM handler can 
+                -- pretty accurately capture the case where this goes
+                -- wrong, so I think if we worked with that, we wouldn't
+                -- need this atrocious hack.
+                Just (OnceArg rate, OnceArg n) -> hillSumMacro (functionArgToStateVariable . unspanned <$> chems) (fromJust (functionArgToParameter (unspanned rate))) (fromJust (functionArgToParameter (unspanned n)))
                 _ -> error "hillsum not called with correct rate and n parameters"
         else error "HillSum called with the wrong number of named parameters"
     _ -> error "This is an error"
@@ -740,14 +800,14 @@ hillSumWrapper positional named =
 evaluateMacro :: MacroProvider -> String -> [FunctionArgValue] -> M.Map String FunctionArgValue -> ExportAST
 evaluateMacro _ name positional namedArgs = if name == "HillSum" then hillSumWrapper positional namedArgs else error "only the hillsum function is supported"
 
-equationToNormalForm :: Equation -> M.Map String [EquationNormalFormDef]
+equationToNormalForm :: Equation -> M.Map StateVariable [EquationNormalFormDef]
 equationToNormalForm eqn =
   let names = chemicalNamesAsList eqn
       unified = (group . sort) names
       unifiedNormals = (fmap . concatMap) (`equationSpeciesToNormalForm` eqn) unified
    in M.fromList (zip (head <$> unified) unifiedNormals)
 
-equationsToNormalForm :: [Equation] -> M.Map String [EquationNormalFormDef]
+equationsToNormalForm :: [Equation] -> M.Map StateVariable [EquationNormalFormDef]
 equationsToNormalForm = M.unionsWith (<>) . fmap equationToNormalForm
 
 foldEitherLeft :: (Monoid b) => [Either b a] -> Either b [a]
@@ -778,21 +838,20 @@ foldHashmapLeft hashmap = do
   return outputMap
 
 resolveEquations ::
-  (SemanticErrorEff :> es, Error (Diag.Diagnostic String) :> es) =>
+  (SemanticErrorEff :> es) =>
   MacroProvider ->
-  M.Map String [EquationNormalFormDef] ->
+  M.Map StateVariable [EquationNormalFormDef] ->
   Eff es ResolvedVariableModel
 resolveEquations macroProvider normalForms = do
   converted <- traverse (speciesNormalFormToExportAST macroProvider) normalForms
   equationResolved <- semLiftEitherDiag $ foldHashmapLeft converted
   return $ resolvedModelFromEquations equationResolved
 
-
 typstExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
 typstExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns) = do
   CW.scoped "$" $ do
     forM_ (M.toList eqns) $ \(species, definition) -> do
-      CW.push $ "(dif " <> exportASTToTypst (ExportLiteral LiteralStateVar species) <> ")/(dif t) &= " <> (exportASTToTypst' . simpleExportAST) definition <> "\\"
+      CW.push $ "(dif " <> joinPolymer ":" species <> ")/(dif t) &= " <> (exportASTToTypst' . simpleExportAST) definition <> "\\"
 
   CW.push "$"
   return ()
@@ -800,7 +859,7 @@ typstExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns
 asciiExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (Eff es) ()
 asciiExporter _ (ResolvedVariableModel _stateVars _sysParams _ _ _dependent eqns) = do
   forM_ (M.toList eqns) $ \(species, definition) -> do
-    CW.push $ species <> " = " <> (exportToASCII . simpleExportAST) definition
+    CW.push $ joinPolymer "__di__" species <> " = " <> (exportToASCII . simpleExportAST) definition
 
 juliaExporter :: (CW.CodeWriter :> es) => String -> ResolvedVariableModel -> (T.Text -> Maybe T.Text) -> (Eff es) ()
 juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed implicit _dependent eqns) defaultValueLookup = do
@@ -811,13 +870,15 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   let paramStructName = modelName <> "Params"
   let computedParamStructName = modelName <> "ComputedParams"
   let stateStructName = modelName <> "StateVars"
+  let varToString = joinPolymer "__di__"
+
 
   CW.scoped ("@Base.kwdef struct " <> paramStructName) $ do
     forM_ sysParamsList $ \var -> do
-      let defaultValue = defaultValueLookup (T.pack var)
+      let defaultValue = defaultValueLookup ((T.pack . parameterToString) var)
       case defaultValue of
-        Just def_value -> CW.push $ var <> " = " <> (T.unpack def_value)
-        Nothing -> CW.push var
+        Just def_value -> CW.push $ parameterToString var <> " = " <> T.unpack def_value
+        Nothing -> CW.push $ parameterToString var
 
   CW.push "end"
 
@@ -826,13 +887,13 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   unless (null computed) $ do
     CW.scoped ("@Base.kwdef struct " <> computedParamStructName) $ do
       forM_ computedParamsList $ \var ->
-        CW.push var
+        CW.push $ parameterToString var
 
   CW.push "end"
   CW.newline
 
   CW.scoped ("function Base.convert(::Type{Vector}, s::" <> paramStructName <> ")") $ do
-    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) <$> sysParamsList) ++ "]"
+    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) . parameterToString <$> sysParamsList) ++ "]"
 
   CW.push "end"
 
@@ -844,7 +905,7 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
     CW.indented $ do
       forM_ (zip sysParamsList [1 :: Int ..]) $ \(var, idx) -> do
-        CW.push $ var <> " = " <> "fromVec[" <> show idx <> "],"
+        CW.push $ parameterToString var <> " = " <> "fromVec[" <> show idx <> "],"
 
     CW.push ")"
 
@@ -854,14 +915,14 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.scoped ("@Base.kwdef struct " <> stateStructName) $ do
     forM_ stateVarList $ \var -> do
-      CW.push var
+      CW.push  $ varToString var
 
   CW.push "end"
 
   CW.newline
 
   CW.scoped ("function Base.convert(::Type{Vector}, s::" <> stateStructName <> ")") $ do
-    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) <$> stateVarList) ++ "]"
+    CW.push $ "return " <> "[" ++ intercalate ", " (("s." <>) . varToString <$> stateVarList) ++ "]"
 
   CW.push "end"
 
@@ -873,7 +934,7 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
     CW.indented $ do
       forM_ (zip stateVarList [1 :: Int ..]) $ \(var, idx) -> do
-        CW.push $ var <> " = " <> "fromVec[" <> show idx <> "],"
+        CW.push $ varToString var <> " = " <> "fromVec[" <> show idx <> "],"
 
     CW.push ")"
 
@@ -881,15 +942,15 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.newline
 
-  let prefixer' = prefixer (\var -> if var `S.member` computed then "c." else "p.")
+  let prefixer' = prefixer (\var -> if Parameter var `S.member` computed then "c." else "p.")
   -- I believe in Julia this is a valid definition for a differential equation
   -- because the type annotations will coerce the types into what you want them to be.
   CW.scoped ("function d" <> modelName <> "(sv, " <> "p::" <> paramStructName <> ", t)::Vector") $ do
     CW.push ("s::" <> stateStructName <> " = " <> "sv")
     forM_ stateVarList $ \stateVar -> do
-      CW.push ("d" <> stateVar <> " = " <> (exportASTToJulia prefixer' . simpleExportAST $ (eqns M.! stateVar)))
+      CW.push ("d" <> varToString stateVar <> " = " <> (exportASTToJulia prefixer' . simpleExportAST $ (eqns M.! stateVar)))
 
-    CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) <$> stateVarList) ++ "]"
+    CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) . varToString <$> stateVarList) ++ "]"
 
   CW.push "end"
 
@@ -899,24 +960,27 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
     prefixer _ LiteralStateVar input = "s." <> input
     prefixer grouper LiteralParameter input = grouper input <> input
 
+    parameterToString :: Parameter -> String
+    parameterToString (Parameter p) = p
+
 data ResolvedVariableModel = ResolvedVariableModel
-  { resolvedStateVariables :: S.Set String,
-    resolvedSystemParameters :: S.Set String,
-    computedSystemParameters :: S.Set String,
-    implicitSystemParameters :: S.Set String,
+  { resolvedStateVariables :: S.Set StateVariable,
+    resolvedSystemParameters :: S.Set Parameter,
+    computedSystemParameters :: S.Set Parameter,
+    implicitSystemParameters :: S.Set Parameter,
     -- | "dependent variables" are nodes which have
     -- | no dependencies.
-    resolvedDependentStateVariables :: S.Set String,
-    resolvedEquations :: M.Map String ExportAST
+    resolvedDependentStateVariables :: S.Set StateVariable,
+    resolvedEquations :: M.Map StateVariable ExportAST
   }
   deriving (Show)
 
-resolvedModelFromEquations :: M.Map String ExportAST -> ResolvedVariableModel
+resolvedModelFromEquations :: M.Map StateVariable ExportAST -> ResolvedVariableModel
 resolvedModelFromEquations eqns =
   let exportASTs = M.elems eqns
-      independentStateVars = foldMap (exportASTGetVariables LiteralStateVar) exportASTs
+      independentStateVars = foldMap exportASTGetStateVars exportASTs
       stateVars = S.fromList (M.keys eqns)
-      paramVars = foldMap (exportASTGetVariables LiteralParameter) exportASTs
+      paramVars = foldMap exportASTGetParameters exportASTs
    in ResolvedVariableModel
         { resolvedStateVariables = stateVars,
           resolvedSystemParameters = paramVars,
@@ -942,7 +1006,8 @@ qualifyResolvedVariables decls model =
         }
 
 exportASTToJulia :: (LiteralType -> String -> String) -> ExportAST -> String
-exportASTToJulia prefixer (ExportLiteral littype lit) = prefixer littype lit
+exportASTToJulia prefixer (ExportStateVar stateVar) = prefixer LiteralStateVar (joinPolymer "__di__" stateVar)
+exportASTToJulia prefixer (ExportParameter (Parameter param)) = prefixer LiteralParameter  param
 exportASTToJulia prefixer x = exportUsingASCII (exportASTToJulia prefixer) x
 
 basicMacroProvider :: MacroProvider
@@ -958,12 +1023,6 @@ basicMacroProvider =
     )
     (M.fromList [("HillSum", hillSumWrapper)])
 
-jsonExport :: String -> ResolvedVariableModel -> String
-jsonExport modelName (ResolvedVariableModel stateVars sysParams _ _ _dependent _eqns) = JE.toString $ JE.fromResolved modelName (typstLit <$> S.toList stateVars) (typstLit <$> S.toList sysParams)
-
-effEither :: (Error e :> es) => Either e a -> Eff es a
-effEither (Left diag) = throwError diag
-effEither (Right a) = return a
 
 lintEquation :: (SemanticErrorEff :> es) => Equation -> (Eff es) Equation
 lintEquation (Equation func1@(Function {}) func2@(Function {}) _) = do
@@ -984,74 +1043,90 @@ lintEquation (Equation (EqnVoids sp1) (EqnVoids sp2) _) = do
   semCommit
 lintEquation eq = return eq
 
-semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String), IOE] a -> IO (Either (Diag.Diagnostic String) a)
-semanticErrorEffToEither = runEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
+semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> Either (Diag.Diagnostic String) a
+semanticErrorEffToEither = runPureEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff
 
+data ProgramInput = ProgramInput
+  { inputModelName :: T.Text,
+    inputModelFilename :: T.Text,
+    inputModelText :: T.Text,
+    inputParameterLookup :: T.Text -> Maybe T.Text,
+    inputExportFormat :: ExportFormat
+  }
 
+runWithInput :: (SemanticErrorEff :> es) => ProgramInput -> (Eff es) T.Text
+runWithInput programInput = do
+  let filePath = T.unpack $ inputModelFilename programInput
+  let text = T.unpack $ inputModelText programInput
 
+  semAddFile filePath text
+  semActivateFile filePath
+
+  -- the lexer error handling is unfortunatly slightly
+  -- more complicated than it otherwise would be here
+  -- simply because the MegaParsec library already handles
+  -- conversion into our error types, so instead we simply
+  -- handle the error over here
+  lexed <- case lex filePath text of
+    Left err -> do
+      semPushDiagnostic err
+      semCommit
+    Right x -> pure x
+
+  (variableQualifiers, modelEquations) <- parseNew lexed
+
+  lints <- fold . lefts <$> traverse (semSubscope . lintEquation) modelEquations
+
+  -- convert them into "normal form"
+  let normalForms = equationsToNormalForm modelEquations
+
+  -- take the equations that are in normal form
+  -- and resolve and expand their macros.
+  resolvedNotQualified <- resolveEquations basicMacroProvider normalForms
+
+  let resolved = qualifyResolvedVariables variableQualifiers resolvedNotQualified
+
+  -- just a convenience helper function for running a model exporter
+  let runExporter model = T.pack $ CW.evalStringCodeWriter 4 (model (T.unpack $ inputModelName programInput) resolved)
+
+  return
+    ( case inputExportFormat programInput of
+        AsciiExport -> runExporter asciiExporter
+        JuliaExport -> T.pack $ CW.evalStringCodeWriter 4 (juliaExporter (T.unpack $ inputModelName programInput) resolved (inputParameterLookup programInput))
+        TypstExport -> runExporter typstExporter
+    )
+
+-- newtype FsError = FsError T.Text deriving Show;
 main :: IO ()
 main = do
   opt <- Cli.cli
 
   case opt of
-    Cli.SubcommandExport (Cli.ExportOpts filePath modelName exportFormat paramsFile) -> do
-      -- read in the file that we're loading the equations from
-      fileContents <- readFile filePath
+    Cli.SubcommandExport
+      (Cli.ExportOpts filePath modelName exportFormat paramsFile) -> do
+        -- read in the file that we're loading the equations from
+        fileContents <- readFile filePath
+        paramFileContents <- TIO.readFile `traverse` paramsFile
 
-      -- now run the error recording effect monad
-      res <- semanticErrorEffToEither $ do
-        -- let's load in the parameters file
-        paramGetter <- traverse (`getDefaultVariableLUT` T.pack modelName) paramsFile
+        -- now run the error recording effect, and parse the
+        -- parameters file from TOML to something we can actually use
+        let res = semanticErrorEffToEither $ do
+              paramGetter <- getDefaultVariableLUT modelName `traverse` paramFileContents
 
-        let paramProvider = case paramGetter of
-              Just x -> x
-              Nothing -> const Nothing
+              let paramProvider = fromMaybe (const Nothing) paramGetter
 
-        -- add the file that we have
-        semAddFile filePath fileContents
-        -- and let the state know that this is the file that
-        -- we're working with
-        semActivateFile filePath
+              let programInput =
+                    ProgramInput
+                      { inputModelName = modelName,
+                        inputModelFilename = T.pack filePath,
+                        inputModelText = T.pack fileContents,
+                        inputParameterLookup = paramProvider,
+                        inputExportFormat = exportFormat
+                      }
+              runWithInput programInput
 
-        -- TODO: this is a bit of an leaky abstraction
-        -- that is using the Diagnostic type as our error
-        -- type, but this is nice and linear to read this way
-        -- so that is at least nice
-
-        -- now lex and then parse our equations file, of course, failing
-        -- if either fails
-
-        (variableQualifiers, modelEquations) <- effEither $ do
-          lexed <- lex filePath fileContents
-          parse filePath fileContents lexed
-
-        lints <- fold . lefts <$> traverse (semSubscope . lintEquation) modelEquations
-
-        Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle lints
-
-        -- lint the equations
-
-        -- convert them into "normal form"
-        let normalForms = equationsToNormalForm modelEquations
-
-        -- take the equations that are in normal form
-        -- and resolve and expand their macros.
-        resolvedNotQualified <- resolveEquations basicMacroProvider normalForms
-
-        let resolved = qualifyResolvedVariables variableQualifiers resolvedNotQualified
-
-        -- just a convenience helper function for running a model exporter
-        let runExporter model = CW.evalStringCodeWriter 4 (model modelName resolved)
-
-        return
-          ( case exportFormat of
-              Cli.JSONExport -> jsonExport modelName resolved
-              Cli.AsciiExport -> runExporter asciiExporter
-              Cli.JuliaExport -> CW.evalStringCodeWriter 4 (juliaExporter modelName resolved paramProvider)
-              Cli.TypstExport -> runExporter typstExporter
-          )
-      case res of
-        Left err -> do
-          void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
-        Right success ->
-          liftIO $ putStrLn success
+        case res of
+          Left err -> do
+            void $ Diag.printDiagnostic stderr Diag.WithUnicode (Diag.TabSize 2) Diag.defaultStyle err
+          Right success ->
+            putStrLn (T.unpack success)
