@@ -480,12 +480,12 @@ executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArg
   (MacroTypeDefinition namedP positionP) <- semLiftMaybe (M.lookup name (macroTypeDecls macroProvider)) $ do
     semSetErrorCode "MACRO_SIG_NOT_FOUND"
     semSetErrorMessage $ "Missing function definition: " <> name
-    semAddMarker nameSpan (Diag.This $ "The macro named `" <> name <> "` was not found in scope")
+    semAddMarker nameSpan $ "The macro named `" <> name <> "` was not found in scope"
 
   evalProvider <- semLiftMaybe (M.lookup name (macroEvaluators macroProvider)) $ do
     semSetErrorCode "MACRO_DEF_NOT_FOUND"
     semSetErrorMessage $ "No macro named " <> name <> "was found in scope."
-    semAddMarker nameSpan (Diag.This "This function was not found in scope")
+    semAddMarker nameSpan  "This function was not found in scope"
 
   -- let's validate that we have enough, and then we're going to validate
   -- that we have matching types
@@ -493,9 +493,9 @@ executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArg
     semBuildError $ do
       semSetErrorCode "FUNC_POS_ARITY_ERR"
       semSetErrorMessage $ name <> " expects that " <> show (length positionP) <> " positional arguments will be passed, but " <> (show . length) positionArgs <> " were passed"
-      semAddMarker argSpan (Diag.This "incorrect number of arguments passed here")
-      semAddHint $ Diag.Note $ "The position arguments to " <> name <> " are as follows: " <> joinWithAnd (fst <$> positionP)
-      semAddHint $ Diag.Hint "Making a positional argument named or vice versa is not supported."
+      semAddMarker argSpan "incorrect number of arguments passed here"
+      semAddNote $ "The position arguments to " <> name <> " are as follows: " <> joinWithAnd (fst <$> positionP)
+      semAddHint "Making a positional argument named or vice versa is not supported."
 
   -- now we're going to typecheck the positional parameters.
   -- TODO: if type inference is added, then dont' erase the inner types while checking this.
@@ -506,14 +506,14 @@ executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArg
             semBuildError $ do
               semSetErrorCode "MACRO_ARG_TYPE_INCOMPATIBILITY"
               semSetErrorMessage "Macro argument had an incorrect type passed"
-              semAddMarker (computeSpan actualArg) (Diag.This "A single rate constant or chemical was passed, but a list of chemicals or rate constants is required in this position")
-              semAddHint $ Diag.Hint "Pass a list of rate constants (for example: [R1, R2]) or a list of chemicals (for example: [NaCL, NaOH])"
+              semAddMarker (computeSpan actualArg) "A single rate constant or chemical was passed, but a list of chemicals or rate constants is required in this position"
+              semAddHint "Pass a list of rate constants (for example: [R1, R2]) or a list of chemicals (for example: [NaCL, NaOH])"
           ListArg _
             | (desiredType /= MacroRateConstantListTy) && (desiredType /= MacroChemicalListTy) -> do
                 semBuildError $ do
                   semSetErrorCode "MACRO_ARG_TYPE_INCOMPATIBILITY"
                   semSetErrorMessage "Macro argument had an incorrect type passed"
-                  semAddMarker (computeSpan actualArg) (Diag.This "A list was passed but a single rate constant or chemical species was expected")
+                  semAddMarker (computeSpan actualArg) "A list was passed but a single rate constant or chemical species was expected"
           _ -> pure ()
   forM_ (zip (snd <$> positionP) positionArgs) $ uncurry typecheck
   -- now we want to move onto the named parameters, since I believe those will be tricky as well.
@@ -528,15 +528,15 @@ executeMacro macroProvider (Spanned nameSpan name) argSpan positionArgs namedArg
       semSetErrorCode "MACRO_NAMED_PARAMETER_MISSING"
       semSetErrorMessage $ "Missing named arguments to macro " <> name
       if Set.size inParams == 1
-        then semAddMarker argSpan (Diag.This $ "Missing argument named `" <> joinWithAnd (Set.toList inParams) <> "` whilst calling " <> name)
-        else semAddMarker argSpan (Diag.This $ "Missing " <> joinWithAnd (Set.toList inParams) <> " arguments to " <> name)
+        then semAddMarker argSpan ( "Missing argument named `" <> joinWithAnd (Set.toList inParams) <> "` whilst calling " <> name)
+        else semAddMarker argSpan ( "Missing " <> joinWithAnd (Set.toList inParams) <> " arguments to " <> name)
 
   unless (null inArgs) $
     semBuildError $ do
       semSetErrorCode "MACRO_UNKNOWN_NAMED_ARGUMENT"
       semSetErrorMessage $ "Unknown parameters passed to " <> name
       -- TODO: point to the actual argument not all of them
-      semAddMarker argSpan (Diag.This $ "Unknown parameters" <> joinWithAnd (Set.toList inArgs))
+      semAddMarker argSpan ( "Unknown parameters" <> joinWithAnd (Set.toList inArgs))
 
   -- let's do a typecheck on the rest.
   forM_ (M.elems inBoth) $ uncurry typecheck
@@ -723,13 +723,14 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   CW.newline
 
   let astParameterToJulia' var = parameterToJulia (if var `S.member` computed then "c." else "p.") var
+  let prefixStateVar var =  "s." <> stateVarToJulia var
 
   -- I believe in Julia this is a valid definition for a differential equation
   -- because the type annotations will coerce the types into what you want them to be.
   CW.scoped ("function d" <> modelName <> "(sv, " <> "p::" <> paramStructName <> ", t)::Vector") $ do
     CW.push ("s::" <> stateStructName <> " = " <> "sv")
     forM_ stateVarList $ \stateVar -> do
-      CW.push ("d" <> stateVarToJulia stateVar <> " = " <> (exportASTToJulia astParameterToJulia' stateVarToJulia. simpleExportAST $ (eqns M.! stateVar)))
+      CW.push ("d" <> stateVarToJulia stateVar <> " = " <> (exportASTToJulia astParameterToJulia' prefixStateVar . simpleExportAST $ (eqns M.! stateVar)))
 
     CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) . stateVarToJulia <$> stateVarList) ++ "]"
 
@@ -738,7 +739,7 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
   return ()
   where
     stateVarToJulia :: StateVariable -> String
-    stateVarToJulia sv = "s." <> joinPolymer "__di__" sv
+    stateVarToJulia = joinPolymer "__di__"
 
     parameterToJulia :: String -> Parameter -> String
     parameterToJulia prefix (Parameter param)= prefix <> param
@@ -812,16 +813,16 @@ lintEquation (Equation macro1@(Macro {}) macro2@(Macro {}) _) = do
   semBuildError $ do
     semSetErrorCode "TWO_SIDED_MACRO"
     semSetErrorMessage "Macros are only allowed one side of chemical reactions"
-    semAddMarker (computeSpan macro1) (Diag.This "This macro...")
-    semAddMarker (computeSpan macro2) (Diag.This "... and this macro cannot be on both sides")
+    semAddMarker (computeSpan macro1) "This macro..."
+    semAddMarker (computeSpan macro2) "... and this macro cannot be on both sides"
     semMakeIntoWarning
   semCommit
 lintEquation (Equation (EqnVoids sp1) (EqnVoids sp2) _) = do
   semBuildError $ do
     semSetErrorCode "TWO_SIDED_VOID"
     semSetErrorMessage "A void expression on both sides is functionally a no-op, and is not supported."
-    semAddMarker sp1 (Diag.This "This void...")
-    semAddMarker sp2 (Diag.This "... and this void cannot be on opposite sides")
+    semAddMarker sp1 "This void..."
+    semAddMarker sp2 "... and this void cannot be on opposite sides"
     semMakeIntoWarning
   semCommit
 lintEquation eq = return eq
@@ -850,11 +851,7 @@ runWithInput programInput = do
   -- simply because the MegaParsec library already handles
   -- conversion into our error types, so instead we simply
   -- handle the error over here
-  lexed <- case lex filePath text of
-    Left err -> do
-      semPushDiagnostic err
-      semCommit
-    Right x -> pure x
+  lexed <- lexer filePath text
 
   (variableQualifiers, modelEquations) <- parse lexed
 

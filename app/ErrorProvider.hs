@@ -36,9 +36,9 @@ import Effectful.Dispatch.Dynamic (reinterpret, send)
 import Effectful.Error.Dynamic (Error, runErrorNoCallStack, throwError)
 import Effectful.State.Static.Local (evalState, execState, gets, modify)
 import qualified Error.Diagnose as Diag
-import Lexer (Span (..))
 import Data.Bifunctor (first)
 import Control.Monad (forM_, void)
+import Utils (Span (Span))
 
 
 
@@ -63,11 +63,23 @@ semSetErrorMessage :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
 semSetErrorMessage x = send (SemSetErrorMessage x)
 
 -- | add a marker (diagnostic) to this error
-semAddMarker :: (SemanticErrorBuilder :> es) => Span -> Diag.Marker String -> (Eff es) ()
-semAddMarker sp x = send (SemAddMarker sp x)
+semAddMarker :: (SemanticErrorBuilder :> es) => Span -> String -> (Eff es) ()
+semAddMarker sp x = send (SemAddMarker sp (Diag.This x))
 
-semAddHint :: (SemanticErrorBuilder :> es) => Diag.Note String -> (Eff es) ()
-semAddHint x = send (SemAddHint x)
+semAddMarkerWhere :: (SemanticErrorBuilder :> es) => Span -> String -> (Eff es) ()
+semAddMarkerWhere sp x = send (SemAddMarker sp (Diag.Where x))
+
+semAddMarkerMaybeFix :: (SemanticErrorBuilder :> es) => Span -> String -> (Eff es) ()
+semAddMarkerMaybeFix sp x = send (SemAddMarker sp (Diag.Maybe x))
+
+semForceIncludeSpan :: (SemanticErrorBuilder :> es) => Span -> (Eff es) ()
+semForceIncludeSpan sp = send (SemAddMarker sp Diag.Blank)
+
+semAddHint :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
+semAddHint x = send (SemAddHint (Diag.Hint x))
+
+semAddNote :: (SemanticErrorBuilder :> es) => String -> (Eff es) ()
+semAddNote x = send (SemAddHint (Diag.Note x))
 
 semMakeIntoWarning :: (SemanticErrorBuilder :> es) => (Eff es) ()
 semMakeIntoWarning = send SemMakeIntoWarning
