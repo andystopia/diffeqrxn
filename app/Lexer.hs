@@ -12,6 +12,7 @@ import qualified Error.Diagnose as Diag
 import Error.Diagnose.Compat.Megaparsec (HasHints)
 import qualified Error.Diagnose.Compat.Megaparsec as Diag
 import Text.Megaparsec hiding (Token)
+import Control.Applicative hiding (many, some)
 import Text.Megaparsec.Char
 import Effectful ((:>), Eff)
 import ErrorProvider
