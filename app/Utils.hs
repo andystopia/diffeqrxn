@@ -17,7 +17,7 @@ joinWithAnd [a, b] = a <> " and " <> b
 joinWithAnd [a, b, c] = a <> ", " <> b <> ", and " <> c
 joinWithAnd (a : rest) = a <> ", " <> joinWithAnd rest
 
-data Span = Span {line :: Int, startCol :: Int, endCol :: Int} deriving (Show)
+data Span = Span {spanLine :: Int, spanStartCol :: Int, spanEndCol :: Int} deriving (Show)
 
 
 class Spannable a where
