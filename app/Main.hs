@@ -40,6 +40,7 @@ import Lexer
 import Parser
 import System.IO (stderr)
 import TomlParamProvider (getDefaultVariableLUT)
+import qualified LuaMacroEvaluator as LuaMacro;
 import Utils
 import Prelude hiding (lex)
 
@@ -722,6 +723,36 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
 
   CW.newline
 
+  -- juliaAllocatingDiffEq eqns stateVarList computed modelName paramStructName stateStructName
+  juliaNonAllocatingDiffEq eqns stateVarList computed modelName paramStructName
+
+  -- let astParameterToJulia' var = parameterToJulia (if var `S.member` computed then "c." else "p.") var
+  -- let prefixStateVar var =  "s." <> stateVarToJulia var
+
+  -- -- I believe in Julia this is a valid definition for a differential equation
+  -- -- because the type annotations will coerce the types into what you want them to be.
+  -- CW.scoped ("function d" <> modelName <> "(sv, " <> "p::" <> paramStructName <> ", t)::Vector") $ do
+  --   CW.push ("s::" <> stateStructName <> " = " <> "sv")
+  --   forM_ stateVarList $ \stateVar -> do
+  --     CW.push ("d" <> stateVarToJulia stateVar <> " = " <> (exportASTToJulia astParameterToJulia' prefixStateVar . simpleExportAST $ (eqns M.! stateVar)))
+
+  --   CW.push $ "return " <> "[" ++ intercalate ", " (("d" <>) . stateVarToJulia <$> stateVarList) ++ "]"
+
+  -- CW.push "end"
+
+  return ()
+  where
+    stateVarToJulia :: StateVariable -> String
+    stateVarToJulia = joinPolymer "__di__"
+
+    -- parameterToJulia :: String -> Parameter -> String
+    -- parameterToJulia prefix (Parameter param)= prefix <> param
+
+    parameterToString :: Parameter -> String
+    parameterToString (Parameter p) = p
+
+juliaAllocatingDiffEq ::(CW.CodeWriter :> es) => M.Map StateVariable ExportAST -> [StateVariable] -> Set.Set Parameter -> String -> String -> String -> (Eff es) () 
+juliaAllocatingDiffEq eqns stateVarList computed modelName paramStructName stateStructName = do
   let astParameterToJulia' var = parameterToJulia (if var `S.member` computed then "c." else "p.") var
   let prefixStateVar var =  "s." <> stateVarToJulia var
 
@@ -744,8 +775,30 @@ juliaExporter modelName (ResolvedVariableModel stateVars sysParams computed impl
     parameterToJulia :: String -> Parameter -> String
     parameterToJulia prefix (Parameter param)= prefix <> param
 
-    parameterToString :: Parameter -> String
-    parameterToString (Parameter p) = p
+-- | the idea here is that julia really 
+-- | prefers that you don't allocate when you're writing
+-- | your evaluation function, so this one tries to implement that
+juliaNonAllocatingDiffEq ::(CW.CodeWriter :> es) => M.Map StateVariable ExportAST -> [StateVariable] -> Set.Set Parameter -> String -> String  -> (Eff es) () 
+juliaNonAllocatingDiffEq eqns stateVarList computed modelName paramStructName  = do
+  let astParameterToJulia' var = parameterToJulia (if var `S.member` computed then "c." else "p.") var
+  let stateVarMap = M.fromList (zip stateVarList [1 :: Int ..])
+  let prefixStateVar var = "sv[" <> show (stateVarMap M.! var) <> "]" 
+
+  -- I believe in Julia this is a valid definition for a differential equation
+  -- because the type annotations will coerce the types into what you want them to be.
+  CW.scoped ("function d" <> modelName <> "(du, sv, " <> "p::" <> paramStructName <> ", t)") $ do
+    forM_ stateVarList $ \stateVar -> do
+      CW.push ("du[" <> show (stateVarMap M.! stateVar) <> "] = " <> (exportASTToJulia astParameterToJulia' prefixStateVar . simpleExportAST $ (eqns M.! stateVar)))
+
+    CW.push "return nothing"
+
+  CW.push "end"
+
+  return ()
+  where
+    parameterToJulia :: String -> Parameter -> String
+    parameterToJulia prefix (Parameter param)= prefix <> param
+
 
 data ResolvedVariableModel = ResolvedVariableModel
   { resolvedStateVariables :: S.Set StateVariable,
@@ -879,6 +932,7 @@ runWithInput programInput = do
 -- newtype FsError = FsError T.Text deriving Show;
 main :: IO ()
 main = do
+  _ <- LuaMacro.evalRun
   opt <- Cli.cli
 
   case opt of
