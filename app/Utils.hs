@@ -1,7 +1,6 @@
 module Utils where
 
-
-data ExportFormat = JuliaExport |  TypstExport | AsciiExport deriving Show;
+data ExportFormat = JuliaExport | TypstExport | AsciiExport deriving (Show)
 
 joinWithOr :: [String] -> String
 joinWithOr [] = ""
@@ -19,6 +18,14 @@ joinWithAnd (a : rest) = a <> ", " <> joinWithAnd rest
 
 data Span = Span {spanLine :: Int, spanStartCol :: Int, spanEndCol :: Int} deriving (Show)
 
+-- | reduce the span down to just the last column
+squashSpanEnd :: Span -> Span
+squashSpanEnd inspan =
+  Span
+    { spanLine = spanLine inspan,
+      spanStartCol = spanEndCol inspan,
+      spanEndCol = spanEndCol inspan
+    }
 
 class Spannable a where
   computeSpan :: a -> Span
@@ -51,4 +58,3 @@ sequenceSpan ((Spanned sp v) : rest) =
 
 unspanned :: Spanned a -> a
 unspanned (Spanned _ v) = v
-

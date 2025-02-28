@@ -227,3 +227,5 @@ semCommitIfErrs = void (send SemCommitIfErrs)
 semBuildError :: (SemanticErrorEff :> es) => Eff '[SemanticErrorBuilder] () -> (Eff es) ()
 semBuildError e = send (SemBuildError e)
 
+semanticErrorEffToEither :: Eff '[SemanticErrorEff, Error (Diag.Diagnostic String)] a -> Either (Diag.Diagnostic String) a
+semanticErrorEffToEither = runPureEff . runErrorNoCallStack @(Diag.Diagnostic String) . runSemanticErrorEff

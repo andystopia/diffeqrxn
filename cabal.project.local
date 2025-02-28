@@ -1,2 +1,4 @@
 ignore-project: False
 constraints: diagnose +megaparsec-compat
+allow-newer: diagnose:text
+allow-newer: diagnose:containers

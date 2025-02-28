@@ -2,7 +2,7 @@
   description = "A basic haskell cabal template dev env with hls";
 
   # Nixpkgs / NixOS version to use.
-  inputs.nixpkgs.url = "nixpkgs/nixos-24.05";
+  inputs.nixpkgs.url = "nixpkgs/nixos-unstable";
 
   nixConfig = {
     allowBroken = true;
@@ -41,13 +41,13 @@
           starship
           # put other package below
           cabal-install
-          haskell.compiler.ghc96
+          haskell.compiler.ghc910
           haskellPackages.implicit-hie
         ];
 
         nativeBuildInputs = with pkgs; [
-          haskell.compiler.ghc96
-          haskell-language-server
+          haskell.compiler.ghc910
+          (haskell-language-server.override {  supportedGhcVersions =  [ "910" ]; })
         ];
 
         shellHook = "

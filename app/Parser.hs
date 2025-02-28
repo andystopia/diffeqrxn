@@ -28,7 +28,7 @@ import Text.Earley
 import ErrorProvider
 import Effectful ((:>), Eff)
 import Control.Monad (forM_)
-import Utils (joinWithOr, Spanned (Spanned), Span, Spannable (computeSpan), sequenceSpan, unspanned)
+import Utils (joinWithOr, Spanned (Spanned), Span, Spannable (computeSpan), sequenceSpan, unspanned, squashSpanEnd)
 import Data.Either (partitionEithers)
 import Data.Tuple (swap)
 
@@ -219,10 +219,16 @@ parse tokens = do
     semBuildError $ do
       semSetErrorCode "FAILED_PARSING"
       semSetErrorMessage parseErrorMessage
-      semAddMarker (computeSpan (errLine !! pos)) expectedMessage
+      semAddMarker (idxErrorLine errLine pos) expectedMessage
 
   semCommitIfErrs
 
-  let eqns' = head <$> eqns
+  let eqns' = [head eqn | eqn <- eqns, (not . null) eqn]
   let seperated = swap (partitionEithers eqns')
   return seperated
+
+  where
+    idxErrorLine :: [Spanned Token] -> Int -> Span
+    idxErrorLine line idx = if idx >= length line then (squashSpanEnd $ computeSpan $ last line) else computeSpan (line !! idx) 
+
+
